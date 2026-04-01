@@ -1,0 +1,9 @@
+trl>=0.12.0
+transformers>=4.45.0
+datasets
+accelerate
+torch
+scipy
+numpy
+matplotlib
+wandb
