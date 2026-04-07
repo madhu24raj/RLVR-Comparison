@@ -1,0 +1,32 @@
+# PPO Configuration for RLVR-Comparison
+# Used by scripts/train_exp_2_7.py and scripts/train_exp_2_8.py
+
+model:
+  name: "Qwen/Qwen2.5-7B"
+  torch_dtype: "bfloat16"
+
+data:
+  n_prompts: 100
+  seed: 42
+
+training:
+  n_steps: 200
+  batch_size: 8
+  mini_batch_size: 4
+  learning_rate: 1.0e-5
+  max_new_tokens: 512
+
+generation:
+  temperature: 0.7
+  top_p: 0.9
+  do_sample: true
+
+# E2.7: Head-to-head (use one critic config)
+exp_2_7:
+  critic_config: "medium"
+  seeds: [42, 123, 456]
+
+# E2.8: Critic sweep (vary critic config)
+exp_2_8:
+  critic_configs: ["none", "small", "medium", "large"]
+  seeds: [42, 123, 456]
