@@ -31,16 +31,24 @@ ppo_specs/
 ├── critic.py          ← Four critic architectures + build_critic() factory
 ├── advantage.py       ← Advantage computation, MC estimation, error metrics
 ├── ppo_trainer.py     ← PPOTrainer: rollouts → PPO-clip update → eval
+├── checkpoint.py      ← Checkpoint save/load, signal handling, resume
 ├── utils.py           ← Shared helpers (cycle_batch, setup_mc_baselines)
 │
 ├── run_e2_7.py        ← E2.7 head-to-head experiment (PPO portion)
 ├── run_e2_8.py        ← E2.8 critic quality sweep
 │
+├── tests/             ← Test suite (see Tests section below)
+│
 └── specs/             ← Fix specifications from code review (see below)
     ├── readability.md
     ├── safety.md
     ├── logic.md
-    └── performance.md
+    ├── performance.md
+    ├── batched_generation.md
+    ├── memory_optimization.md
+    ├── checkpointing.md
+    ├── cluster_deployment.md
+    └── distributed.md
 ```
 
 ### Dependency graph
@@ -58,6 +66,7 @@ ppo_trainer.py ──► critic.py
     ▼
 run_e2_7.py ──► utils.py
 run_e2_8.py ──► utils.py
+            ──► checkpoint.py  (save/load/resume, signal handling)
 ```
 
 ---
@@ -106,6 +115,80 @@ python ppo_specs/run_e2_8.py --capacity medium --seed 0
 
 ---
 
+### Tests
+
+```
+ppo_specs/tests/
+├── test_trainer.py          ← Core PPO trainer tests
+├── test_advantage.py        ← Advantage computation and critic tests
+├── test_data_rewards.py     ← Data loading and reward function tests
+├── test_batched_ops.py      ← Batched generation correctness tests
+├── test_checkpoint.py       ← Checkpoint save/load/resume tests
+├── test_cluster_features.py ← Dtype, gradient checkpointing tests
+└── test_e2e_pipeline.py     ← End-to-end integration tests
+```
+
+Run all tests:
+```bash
+python -m pytest ppo_specs/tests/ -v -m "not slow"   # fast tests only
+python -m pytest ppo_specs/tests/ -v                   # all tests (needs model download)
+```
+
+---
+
+## Cluster Deployment
+
+The codebase now supports running on GPU clusters out of the box. Key features:
+
+### Dtype selection
+
+Models load in bfloat16 on GPU by default (`torch_dtype: "auto"`). Override via config:
+```python
+cfg = e2_7_config(seed=0)
+cfg.torch_dtype = "bfloat16"   # explicit bf16
+cfg.torch_dtype = "float32"    # force fp32 (CPU or debugging)
+```
+Or leave as `"auto"` (default) for automatic detection: bfloat16 on CUDA, float32 on CPU.
+
+### Gradient checkpointing
+
+Required for 8B+ models to avoid OOM. Enable in config:
+```python
+cfg.gradient_checkpointing = True
+```
+Uses `use_reentrant=False` for compatibility with torch.compile and multi-GPU.
+
+### Checkpoint and resume
+
+Checkpoints are saved atomically (write to temp dir, then rename) and rotated
+to keep the last K versions:
+```python
+cfg.checkpoint_every = 20      # save every 20 steps
+cfg.keep_checkpoints = 3       # keep last 3
+cfg.checkpoint_dir = "results/checkpoints"
+```
+
+To resume from a checkpoint:
+```python
+cfg.resume_from = "auto"       # find latest checkpoint
+cfg.resume_from = "results/checkpoints/ppo_e2_7_seed0/checkpoint_step_000100"  # specific
+```
+
+Full state is restored: model weights, critic, optimizers, RNG states, logger, and
+training counters. Config compatibility is verified via hash on resume.
+
+### Signal handling for SLURM preemption
+
+The training loop uses `GracefulExitHandler` to catch SIGTERM/SIGINT. When a
+signal is received, the current step completes and a checkpoint is saved before
+exit. This integrates with SLURM's `--signal=TERM@60` preemption notification.
+
+### SLURM scripts
+
+See `scripts/` for example SLURM submission scripts with checkpoint/resume support.
+
+---
+
 ## File Reference
 
 ### `config.py`
@@ -129,6 +212,12 @@ Key config fields:
 | `n_ppo_epochs` | `1` | Gradient updates per collected batch |
 | `kl_coeff` | `0.0` | KL penalty weight (0 = disabled) |
 | `batch_size` | `8` | Prompts per training step |
+| `torch_dtype` | `"auto"` | `"auto"` / `"float32"` / `"bfloat16"` -- auto = bf16 on GPU |
+| `gradient_checkpointing` | `False` | Enable gradient checkpointing (required for 8B+) |
+| `checkpoint_every` | `20` | Save checkpoint every N steps (0 = disabled) |
+| `keep_checkpoints` | `3` | Keep last K checkpoints (0 = keep all) |
+| `checkpoint_dir` | `"results/checkpoints"` | Directory for checkpoint storage |
+| `resume_from` | `""` | Checkpoint path, or `"auto"` for latest |
 
 ---
 
@@ -183,6 +272,7 @@ Metrics returned by `train_step`:
 {
   "policy_loss":     float,
   "critic_loss":     float,
+  "kl_divergence":   float,   # KL(pi_old || pi_new), step-level divergence
   "mean_reward":     float,
   "reward_variance": float,
   "mean_advantage":  float,
@@ -289,24 +379,196 @@ For `capacity="none"`, `V̂(s_i)` is replaced by the batch mean `ē = mean(r)`.
 
 ---
 
-## Scaling to Cluster
+## Running on a Compute Cluster
 
-When moving from local to cluster, apply these changes in order:
+### Step 1: Environment setup
 
-| Step | Change | File |
-|------|--------|------|
-| 1 | Change `model_name` to `meta-llama/Meta-Llama-3-8B-Instruct` | `config.py` |
-| 2 | Enable bfloat16: auto-select dtype based on device | `ppo_trainer.py:load_ppo_trainer` |
-| 3 | Enable gradient checkpointing | `ppo_trainer.py:load_ppo_trainer` |
-| 4 | Batch rollout generation (P1 in `specs/performance.md`) | `ppo_trainer.py:generate_rollouts` |
-| 5 | Integrate `accelerate` for multi-GPU (P7 in `specs/performance.md`) | `ppo_trainer.py`, run scripts |
-| 6 | Raise `n_mc` in `utils.setup_mc_baselines` to 1000 | `utils.py` |
+On the cluster's login node, run the setup script to create the conda environment,
+install PyTorch with CUDA, and pre-download model weights:
 
-See `specs/performance.md` for the full priority list and code snippets.
+```bash
+# Basic setup (Qwen2.5-0.5B for development)
+bash scripts/setup_env.sh
+
+# Include Llama-3-8B weights (requires HuggingFace access token)
+bash scripts/setup_env.sh --large-model
+```
+
+If you don't have the setup script or prefer manual setup:
+
+```bash
+conda create -n rlvr python=3.11 -y
+conda activate rlvr
+pip install torch --index-url https://download.pytorch.org/whl/cu128
+pip install -r requirements.txt
+
+# Pre-download model weights (avoids downloading during a GPU job)
+python -c "from transformers import AutoModelForCausalLM, AutoTokenizer; \
+  AutoModelForCausalLM.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct'); \
+  AutoTokenizer.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct')"
+
+# Pre-download GSM8K dataset
+python -c "from datasets import load_dataset; load_dataset('openai/gsm8k', 'main')"
+```
+
+### Step 2: Configure the model
+
+For cluster runs with Llama-3-8B, edit `ppo_specs/config.py`:
+
+```python
+model_name: str = "meta-llama/Meta-Llama-3-8B-Instruct"
+```
+
+Or override it in the preset functions. The dtype and gradient checkpointing
+are handled automatically (bfloat16 on GPU, gradient checkpointing when enabled).
+
+### Step 3: Submit jobs via SLURM
+
+SLURM scripts are in `scripts/`. They handle environment activation, model caching,
+NCCL tuning, preemption signal handling, and checkpoint/resume.
+
+```bash
+# ── E2.7: Head-to-Head ───────────────────────────────────────────────
+
+# Single GPU smoke test
+sbatch scripts/slurm_e2_7.sh
+
+# Single GPU, full run, seed 0
+sbatch --export=ALL,SEED=0 scripts/slurm_e2_7.sh
+
+# 3-seed sweep as a SLURM job array (runs seeds 42, 123, 456 in parallel)
+sbatch --export=ALL,SLURM_MODE=array --array=0-2 scripts/slurm_e2_7.sh
+
+# Multi-GPU (4x A100), required for 8B models
+sbatch --export=ALL,SLURM_MODE=multigpu,NUM_GPUS=4 --gres=gpu:4 scripts/slurm_e2_7.sh
+
+# ── E2.8: Critic Sweep ──────────────────────────────────────────────
+
+# All 4 critic capacities sequentially
+sbatch scripts/slurm_e2_8.sh
+
+# One capacity per SLURM task (parallel)
+sbatch --export=ALL,SLURM_MODE=parallel --array=0-3 scripts/slurm_e2_8.sh
+
+# Single capacity
+sbatch --export=ALL,CAPACITY=medium,SEED=0 scripts/slurm_e2_8.sh
+```
+
+Override cluster-specific settings at submission time:
+
+```bash
+sbatch -p your_partition -A your_account \
+  --export=ALL,SEED=0,MODEL_NAME=meta-llama/Meta-Llama-3-8B-Instruct \
+  scripts/slurm_e2_7.sh
+```
+
+### Step 4: Checkpoint and resume
+
+Checkpoints are saved automatically every N steps (default 20). If a job is
+preempted or crashes, resume from the latest checkpoint:
+
+```bash
+# Auto-resume: finds the latest checkpoint for this experiment
+python ppo_specs/run_e2_7.py --seed 0 --resume-from auto
+
+# Resume from a specific checkpoint
+python ppo_specs/run_e2_7.py --seed 0 \
+  --resume-from results/checkpoints/ppo_e2_7_seed0/checkpoint_step_000100
+```
+
+The SLURM scripts handle preemption automatically via SIGUSR1 trapping.
+When SLURM sends the preemption signal, the current training step completes,
+a checkpoint is saved, and the job requeues itself.
+
+### Step 5: Monitor training
+
+Logs are written to `logs/` and results to `results/`:
+
+```bash
+# Check job status
+squeue -u $USER
+
+# Tail the output log
+tail -f logs/e2_7_<jobid>_0.out
+
+# Check saved results
+cat results/ppo_e2_7_seed0.json | python -m json.tool | head -20
+
+# List checkpoints
+ls results/checkpoints/ppo_e2_7_seed0/
+```
+
+### Running without SLURM
+
+If your cluster uses a different scheduler or you're running interactively:
+
+```bash
+# Interactive GPU session
+srun --gres=gpu:1 --mem=64G --time=4:00:00 --pty bash
+
+# Then run directly
+conda activate rlvr
+cd /path/to/RLVR-Comparison
+python ppo_specs/run_e2_7.py --seed 0 --checkpoint-every 20
+```
+
+For 8B models, enable gradient checkpointing in `config.py`:
+
+```python
+cfg = e2_7_config(seed=0)
+cfg.model_name = "meta-llama/Meta-Llama-3-8B-Instruct"
+cfg.gradient_checkpointing = True  # required to avoid OOM
+# torch_dtype="auto" already selects bfloat16 on GPU
+```
+
+### GPU requirements
+
+| Model | Min GPU | Recommended | Config changes needed |
+|-------|---------|-------------|----------------------|
+| Qwen2.5-0.5B | 1x RTX 3090 (24GB) | 1x A100 40GB | None (default) |
+| Llama-3-8B | 1x A100 80GB | 2x A100 80GB | `gradient_checkpointing=True` |
+| Llama-3-8B + LoRA | 1x A100 40GB | 1x A100 80GB | See `specs/memory_optimization.md` |
+
+### Implementation status
+
+| Feature | Status |
+|---------|--------|
+| Batched generation (left-padding) | Implemented |
+| Auto bfloat16 on GPU | Implemented |
+| Gradient checkpointing | Implemented |
+| Checkpoint save/load/resume | Implemented |
+| SIGTERM/SIGINT graceful exit | Implemented |
+| SLURM job scripts | Provided |
+| Multi-GPU via Accelerate/FSDP | Open (see `specs/distributed.md`) |
+| Wandb integration | Spec only (see `specs/checkpointing.md`) |
 
 ---
 
-## Recent Fixes (2026-04-07)
+## Recent Fixes
+
+### 2026-04-08 -- Cluster readiness
+
+Distributed computing and cluster deployment features:
+
+| File | Change | Category |
+|------|--------|----------|
+| `ppo_trainer.py` | Batched generation with left-padding (fixes P1) | Performance |
+| `ppo_trainer.py` | Batched `_policy_log_probs` and `_critic_forward` (partial P2 fix) | Performance |
+| `ppo_trainer.py` | Batched `evaluate()` with configurable sub-batch size | Performance |
+| `ppo_trainer.py` | Auto bfloat16 on GPU, fp32 on CPU (fixes P8) | Performance |
+| `ppo_trainer.py` | `log_softmax` always in float32 for numerical stability (fixes S14) | Safety |
+| `ppo_trainer.py` | Gradient checkpointing support (fixes P6) | Memory |
+| `ppo_trainer.py` | Empty response shape fix (fixes S4) | Safety |
+| `ppo_trainer.py` | Batched critic/log-prob eliminates GPU memory leaks (fixes S5, S6, S7) | Safety |
+| `ppo_trainer.py` | Attention mask excludes padding from log-probs (fixes S13) | Safety |
+| `advantage.py` | Batched MC rollouts with `repeat()` (fixes P4) | Performance |
+| `run_e2_8.py` | Distinct if/else for critic eval (fixes R7) | Readability |
+| `config.py` | New fields: `torch_dtype`, `gradient_checkpointing`, `checkpoint_every`, `keep_checkpoints`, `checkpoint_dir`, `resume_from` | Config |
+| `checkpoint.py` | New module: atomic checkpoint save/load, rotation, signal handling | Reliability |
+| `run_e2_7.py` | Checkpoint integration with `GracefulExitHandler` and resume | Reliability |
+| `ppo_trainer.py` | `kl_divergence` added to metrics dict | Metrics |
+
+### 2026-04-07 -- Data pipeline and bug fixes
 
 Bugs fixed during the performance and data pipeline review:
 
@@ -335,18 +597,16 @@ Previously fixed (already in codebase):
 The `specs/` folder documents issues found by code review.
 Items that may affect experimental validity:
 
-| Spec | ID | Summary | Severity |
-|------|----|---------|----------|
-| `logic.md` | L12 | `format_prompt` uses plain text, not chat template (confound for instruct models) | Medium |
-| `logic.md` | L13 | Reward "last number" fallback can match intermediate calculations | Low |
-| `logic.md` | L15 | `n_eval=20` during training makes convergence curves noisy | Low |
-| `performance.md` | P1 | Per-sample generation: ~10-15x slower than batched | Critical |
-| `performance.md` | P2 | Double forward pass per sample in PPO update | Critical |
-| `performance.md` | P6 | No gradient checkpointing (OOM for 8B models) | Cluster Blocker |
-| `performance.md` | P8 | float32 on GPU (2x slower than bfloat16) | Moderate |
-| `performance.md` | P9 | Generation logits discarded and recomputed | Moderate |
+| Spec | ID | Summary | Severity | Status |
+|------|----|---------|----------|--------|
+| `logic.md` | L12 | `format_prompt` uses plain text, not chat template | Medium | Open |
+| `logic.md` | L13 | Reward "last number" fallback can match intermediate calculations | Low | Open |
+| `logic.md` | L15 | `n_eval=20` during training makes convergence curves noisy | Low | Open |
+| `performance.md` | P2 | Separate policy/critic forward passes (partially batched) | Moderate | Partial |
+| `performance.md` | P7 | No multi-GPU / accelerate support | Cluster Blocker | Open |
+| `performance.md` | P9 | Generation logits discarded and recomputed | Moderate | Open |
 
-Fix P1, P6, and P8 before running on the cluster.
+Previously critical cluster blockers P1, P6, and P8 are now fixed.
 
 ---
 

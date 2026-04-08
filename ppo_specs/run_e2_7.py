@@ -43,6 +43,10 @@ from eval.metrics import ExperimentLogger
 from ppo_specs.config import PPOConfig, local_test_config, e2_7_config
 from ppo_specs.ppo_trainer import load_ppo_trainer
 from ppo_specs.advantage import estimate_mc_advantages, advantage_estimation_error
+from ppo_specs.checkpoint import (
+    save_checkpoint, load_checkpoint, find_latest_checkpoint,
+    restore_rng_states, GracefulExitHandler,
+)
 from ppo_specs.utils import cycle_batch
 
 
@@ -72,6 +76,41 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
     # ── Trainer ───────────────────────────────────────────────────────────────
     trainer = load_ppo_trainer(config, device)
 
+    # ── Resume from checkpoint if requested ──────────────────────────────────
+    start_step = 0
+    resume_path = config.resume_from
+    if resume_path:
+        ckpt_dir = f"{config.checkpoint_dir}/{config.experiment_name}"
+        if resume_path == "auto":
+            resume_path = find_latest_checkpoint(ckpt_dir)
+        if resume_path:
+            print(f"[E2.7] Resuming from {resume_path}")
+            state = load_checkpoint(resume_path, config, device)
+
+            # Restore model from checkpoint (reload from saved path)
+            from transformers import AutoModelForCausalLM
+            trainer.model = AutoModelForCausalLM.from_pretrained(
+                state["model_path"],
+                torch_dtype=torch.bfloat16 if device.type == "cuda" else torch.float32,
+            ).to(device)
+            trainer.policy_optimizer = torch.optim.AdamW(
+                trainer.model.parameters(), lr=config.learning_rate
+            )
+            trainer.policy_optimizer.load_state_dict(state["policy_optimizer_state_dict"])
+
+            trainer.critic.load_state_dict(state["critic_state_dict"])
+            if trainer.critic_optimizer and state["critic_optimizer_state_dict"]:
+                trainer.critic_optimizer.load_state_dict(state["critic_optimizer_state_dict"])
+
+            trainer.step = state["trainer_step"]
+            trainer.total_rollouts = state["total_rollouts"]
+            start_step = state["step"] + 1  # resume from next step
+            logger = ExperimentLogger(config.experiment_name, config.output_dir)
+            logger.log = state["logger_log"]
+
+            restore_rng_states(state["rng_states"])
+            print(f"[E2.7] Resumed at step {start_step}")
+
     # ── MC baseline (reference for advantage error) ───────────────────────────
     # Use the first 5 training prompts as a fixed reference set.
     # n_samples=10 locally; raise to 1000 on the cluster for paper-quality estimates.
@@ -95,7 +134,11 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
     logger = ExperimentLogger(config.experiment_name, config.output_dir)
     reward_window: list[float] = []  # rolling window for variance (stability)
 
-    for step in range(config.n_steps):
+    # ── Set up graceful exit handler ─────────────────────────────────────
+    exit_handler = GracefulExitHandler()
+    ckpt_dir = f"{config.checkpoint_dir}/{config.experiment_name}"
+
+    for step in range(start_step, config.n_steps):
         batch_p  = cycle_batch(train_prompts, step, config.batch_size)
         batch_gt = cycle_batch(train_gts,     step, config.batch_size)
 
@@ -162,11 +205,27 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
                 log_entry["advantage_error"] = adv_error       # (iv)
 
             logger.log_step(step, **log_entry)
+            logger.save()  # flush to disk after each eval
             print(
                 f"    → test_acc={test_acc:.3f} "
                 f"| stability(var)={stability:.4f}"
                 + (f" | adv_error={adv_error:.4f}" if adv_error is not None else "")
             )
+
+        # ── Checkpoint save ──────────────────────────────────────────────
+        if config.checkpoint_every > 0 and (step + 1) % config.checkpoint_every == 0:
+            save_checkpoint(trainer, step, config, logger, ckpt_dir, config.keep_checkpoints)
+
+        # ── Graceful exit check ──────────────────────────────────────────
+        if exit_handler.should_exit:
+            print(f"[E2.7] Graceful exit requested at step {step}")
+            save_checkpoint(trainer, step, config, logger, ckpt_dir, keep_checkpoints=0)
+            logger.save()
+            return
+
+    # Save final checkpoint
+    if config.checkpoint_every > 0:
+        save_checkpoint(trainer, config.n_steps - 1, config, logger, ckpt_dir, config.keep_checkpoints)
 
     logger.save()
 
@@ -189,9 +248,21 @@ if __name__ == "__main__":
         "--no-mc", action="store_true",
         help="Skip Monte Carlo advantage estimation (faster)",
     )
+    parser.add_argument(
+        "--checkpoint-every", type=int, default=None,
+        help="Save checkpoint every N steps (0 = disabled)",
+    )
+    parser.add_argument(
+        "--resume-from", type=str, default="",
+        help="Path to checkpoint dir, or 'auto' for latest",
+    )
     args = parser.parse_args()
 
     cfg = local_test_config() if args.local_test else e2_7_config(seed=args.seed)
     cfg.seed = args.seed
+    if args.checkpoint_every is not None:
+        cfg.checkpoint_every = args.checkpoint_every
+    if args.resume_from:
+        cfg.resume_from = args.resume_from
 
     run_e2_7(cfg, compute_mc=not args.no_mc)

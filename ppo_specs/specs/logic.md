@@ -225,6 +225,37 @@ Both optimizers update independent parameter sets. VERIFIED.
 
 ---
 
+## Batched Generation (2026-04-08) -- Implemented and Tested
+
+Batched generation is fully implemented in `ppo_trainer.py` and `advantage.py`.
+All per-sample loops have been converted to batched operations. Test coverage
+is provided by `tests/test_batched_ops.py` which verifies log-prob consistency
+between batched and single-sample paths.
+
+## Batched Generation Notes (2026-04-08)
+
+### Left-padding behavior
+Batched generation uses `tokenizer.padding_side = "left"` so that all sequences
+are right-aligned and `model.generate()` can produce tokens at the same position
+across the batch. This changes tokenization behavior compared to the original
+per-sample loop (which had no padding). Left-pad tokens are stripped from outputs
+using the attention mask before building Rollout objects.
+
+### pad_token == eos_token edge case
+When `tokenizer.pad_token` is None (e.g., Llama), it is set to `eos_token`. This
+means left-padding inserts EOS tokens at the start of shorter sequences. The
+attention mask correctly masks these out, so the model does not attend to them.
+`pad_token_id` is passed explicitly to `model.generate()` to prevent early stopping
+on padding tokens.
+
+### Checkpoint atomicity
+`save_checkpoint` writes to a temporary directory (`.tmp_checkpoint_step_NNNNNN`)
+and renames atomically to the final path. This ensures that a crash during save
+does not leave a corrupted checkpoint. Checkpoint rotation deletes the oldest
+checkpoint after the rename succeeds.
+
+---
+
 ## Design Decisions (Intentional, Documented)
 
 ### No Entropy Regularization
@@ -240,6 +271,6 @@ unclipped MSE is preferable.
 Both mechanisms are supported. With kl_coeff=0.0 (default), only clipping is active.
 Document which was used in the paper.
 
-### gamma Default Mismatch
-`compute_advantages` has `gamma=0.99` default but `PPOConfig` sets `gamma=1.0`.
-The parameter is unused for single-step episodes. Harmless but confusing.
+### gamma Default Mismatch (RESOLVED)
+`compute_advantages` default is now `gamma=1.0`, consistent with `PPOConfig`.
+The parameter is unused for single-step episodes.

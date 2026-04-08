@@ -222,7 +222,11 @@ class TestEstimateMCAdvantages:
 
         policy = MagicMock()
         policy.eval = MagicMock()
-        policy.generate = MagicMock(return_value=torch.tensor([[1, 2, 3, 4, 5]]))
+        # generate must return [B, seq_len] matching the input batch size
+        def _mock_generate(input_ids, **kwargs):
+            B = input_ids.shape[0]
+            return torch.tensor([[1, 2, 3, 4, 5]]).repeat(B, 1)
+        policy.generate = MagicMock(side_effect=_mock_generate)
 
         return policy, tokenizer
 

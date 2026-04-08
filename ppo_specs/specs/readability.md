@@ -6,20 +6,14 @@ Each issue follows the format: **Problem → Why it matters → Step-by-step fix
 
 ## R1 — `_cycle_batch` duplicated in both run scripts
 
-**Location:** `run_e2_7.py:48–55`, `run_e2_8.py:64–69`
+**Status**: **Fixed** (2026-04-08)
 
-**Problem:** Identical helper function defined twice. Any future change (e.g. adding a shuffle option) must be applied in two places.
+**Location:** `run_e2_7.py`, `run_e2_8.py`
 
-**Why it matters:** Silent divergence — one copy gets updated, the other doesn't, and the bug only shows up in one experiment.
+**Problem:** Identical helper function defined twice.
 
-**Fix:**
-1. Open `ppo_specs/utils.py` — `cycle_batch` is already defined there.
-2. In `run_e2_7.py`, delete lines 48–55 and add at the top:
-   ```python
-   from ppo_specs.utils import cycle_batch
-   ```
-3. Repeat for `run_e2_8.py` lines 64–69.
-4. Replace all calls `_cycle_batch(...)` → `cycle_batch(...)`.
+**Resolution:** Both scripts now import `cycle_batch` from `ppo_specs.utils`
+instead of defining local copies.
 
 ---
 
@@ -142,22 +136,16 @@ Each issue follows the format: **Problem → Why it matters → Step-by-step fix
 
 ## R7 — Identical if/else branches in `run_e2_8.py`
 
-**Location:** `run_e2_8.py:122–129`
+**Status**: **Fixed** (2026-04-08)
 
-**Problem:**
-```python
-if capacity == "none":
-    est_vals = np.full(len(mc_vals), metrics["mean_reward"])
-else:
-    # Use mean reward as a proxy for critic output
-    est_vals = np.full(len(mc_vals), metrics["mean_reward"])
-```
-Both branches assign the exact same value. The else-branch comment admits this is a placeholder but doesn't fix it.
+**Location:** `run_e2_8.py`
 
-**Why it matters:** This is also a logic bug (see `logic.md` L4). For readability, the dead branch confuses readers into thinking the two cases differ.
+**Problem:** Both if/else branches assigned the same value (`np.full(len(mc_vals), metrics["mean_reward"])`).
 
-**Fix:**
-See `logic.md` L4 for the correct fix (evaluate actual critic values for trainable critics). Once fixed, the if/else will be genuinely distinct and the comment can be removed.
+**Resolution:** The branches are now genuinely distinct. The `"none"` branch generates
+rollouts on reference prompts and uses their batch mean reward. The `else` branch calls
+`trainer._eval_critic_on_prompts(ref_prompts_for_eval)` for actual critic values.
+See also L3/L4 in `logic.md`.
 
 ---
 
@@ -201,24 +189,16 @@ return (
 
 ## R10 — `ALL_CAPACITIES` defined in wrong file
 
-**Location:** `run_e2_8.py:59`
+**Status**: Partially Fixed (2026-04-08)
 
-**Problem:** The list of valid critic capacities is a config-level constant but is buried inside a run script, making it invisible to anything that imports `config.py`.
+**Location:** `ppo_specs/config.py` (line 72), `ppo_specs/run_e2_8.py` (line 62)
 
-**Fix:**
-1. In `ppo_specs/config.py`, add after the `PPOConfig` dataclass:
-   ```python
-   CRITIC_CAPACITIES: list[str] = ["none", "small", "medium", "large"]
-   ```
-2. In `run_e2_8.py`, replace:
-   ```python
-   ALL_CAPACITIES = ["none", "small", "medium", "large"]
-   ```
-   with:
-   ```python
-   from ppo_specs.config import CRITIC_CAPACITIES
-   ```
-3. Update all references `ALL_CAPACITIES` → `CRITIC_CAPACITIES` in `run_e2_8.py`.
+**Problem:** The list of valid critic capacities was buried inside `run_e2_8.py`.
+
+**Current state:** `CRITIC_CAPACITIES: list[str] = ["none", "small", "medium", "large"]`
+is now defined in `config.py`. However, `run_e2_8.py` still defines a local
+`ALL_CAPACITIES` instead of importing from `config.py`. The import should be added
+and the local definition removed.
 
 ---
 

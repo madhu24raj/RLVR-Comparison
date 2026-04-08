@@ -52,6 +52,25 @@ class PPOConfig:
     experiment_name: str = "ppo_default"
     output_dir: str = "results"
 
+    # ── Dtype and Memory ────────────────────────────────────────────────────
+    torch_dtype: str = "auto"           # "auto" | "float32" | "bfloat16" — auto = bf16 on GPU, fp32 on CPU
+    gradient_checkpointing: bool = False # enable gradient checkpointing (required for 8B+ models)
+
+    # ── Checkpointing ───────────────────────────────────────────────────────
+    checkpoint_every: int = 20          # save checkpoint every N steps (0 = disabled)
+    keep_checkpoints: int = 3           # keep last K checkpoints (0 = keep all)
+    checkpoint_dir: str = "results/checkpoints"
+    resume_from: str = ""               # path to checkpoint dir, or "auto" for latest
+
+    # ── Logging ─────────────────────────────────────────────────────────────
+    use_wandb: bool = False
+    wandb_project: str = "rlvr-comparison"
+    wandb_group: str = ""
+    wandb_run_name: str = ""
+
+
+CRITIC_CAPACITIES: list[str] = ["none", "small", "medium", "large"]
+
 
 # ── Preset configs ────────────────────────────────────────────────────────────
 

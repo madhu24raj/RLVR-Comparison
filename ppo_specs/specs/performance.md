@@ -17,17 +17,17 @@ All counts assume `batch_size=B`, `n_ppo_epochs=K`, and `max_new_tokens=T`.
 
 ### Phase 1: `generate_rollouts` (all under `@torch.no_grad()`)
 
-For each of B prompts:
-1. `model.generate()` — autoregressive generation with KV cache. This is
-   ~T forward passes on 1 token each (with cached KV). Cost is roughly
-   equivalent to 1 full-sequence forward pass per prompt.
-2. `_sequence_log_prob()` — 1 full forward pass on the entire sequence
-   (prompt + response, ~512+T tokens). **No KV cache** (`use_cache=False`).
-3. `_critic_value_no_grad()` — 1 forward pass with `output_hidden_states=True`
-   on the prompt only (~512 tokens). Skipped for `capacity="none"`.
+Now **batched** (fixed P1). All B prompts are processed together:
+1. `model.generate()` — single batched call with left-padding. Cost: 1 batched
+   generate over B prompts (equivalent to ~1 full-sequence forward pass total,
+   not B sequential calls).
+2. `_batched_sequence_log_probs()` — 1 batched forward pass on all B sequences
+   (prompt + response). Right-padded to uniform length. No KV cache.
+3. `_batched_critic_values()` — 1 batched forward pass with `output_hidden_states=True`
+   on all B prompts. Skipped for `capacity="none"`.
 
-**Subtotal Phase 1:** B * (1 generate + 1 full_seq_fwd + 1 prompt_fwd)
-= B * (generate + 2) full-equivalent forward passes.
+**Subtotal Phase 1:** 1 batched generate + 1 batched full_seq_fwd + 1 batched prompt_fwd
+= 3 batched forward passes (down from B * 3 sequential passes).
 
 ### Phase 1.5: Advantage precomputation in `train_step`
 
@@ -40,45 +40,44 @@ compute initial critic values for advantage estimation. This is:
 
 ### Phase 2: `ppo_update` (repeated K times)
 
-Each epoch:
-1. `_critic_forward()` — B forward passes with `output_hidden_states=True`
-   under `torch.no_grad()` on the model, but with grad on the critic head.
-   Prompt only (~512 tokens each).
-2. `_policy_log_probs()` — B forward passes **with gradients** on the full
-   sequence (prompt + response). These are the most expensive passes because
-   they build the computation graph for backpropagation.
+Each epoch (now **batched**, partial P2 fix):
+1. `_critic_forward()` — 1 batched forward pass with `output_hidden_states=True`
+   under `torch.no_grad()` on the model, with grad on the critic head only.
+   Prompt only, all B samples in one call.
+2. `_policy_log_probs()` — 1 batched forward pass **with gradients** on the full
+   sequence (prompt + response), all B samples padded to uniform length.
+   These are the most expensive passes because they build the computation graph.
 
-**Subtotal Phase 2:** K * B * 2 forward passes per epoch.
+**Subtotal Phase 2:** K * 2 batched forward passes per epoch (down from K * B * 2).
 
-### Grand Total
+### Grand Total (after batching)
 
 ```
-Total model forward passes per train_step:
-  = B*(generate + 2)        [Phase 1: rollout]
-  + B                       [Phase 1.5: advantage precompute]
-  + K * B * 2               [Phase 2: PPO update epochs]
-  = B*(generate + 3 + 2K)
+Total batched model forward passes per train_step:
+  = 1 batched generate       [Phase 1: rollout]
+  + 1 batched full_seq_fwd   [Phase 1: log probs]
+  + 1 batched prompt_fwd     [Phase 1: critic]
+  + 1 batched prompt_fwd     [Phase 1.5: advantage precompute]
+  + K * 2 batched fwd        [Phase 2: PPO update epochs]
+  = 4 + 2K batched forward passes
 
-For B=16, K=1, T~256:
-  = 16 * (generate + 3 + 2)
-  = 16 * (generate + 5)
-  = 16 generates + 80 full forward passes
+For K=1: 6 batched forward passes per step
+For K=4: 12 batched forward passes per step
 
-For B=16, K=4:
-  = 16 * (generate + 3 + 8)
-  = 16 generates + 176 full forward passes
+Each batched pass processes all B samples in parallel on GPU, providing
+~10-15x throughput improvement over the previous sequential approach.
 ```
 
-### Cost Breakdown by Type
+### Cost Breakdown by Type (after batching)
 
 | Pass type | Count | Grad? | hidden_states? | Sequence length |
 |-----------|-------|-------|----------------|-----------------|
-| `generate()` | B | No | No | ~T autoregressive steps |
-| `_sequence_log_prob` (rollout) | B | No | No | prompt+response |
-| `_critic_value_no_grad` | B | No | Yes | prompt only |
-| `_critic_forward` (precompute) | B | No (full) | Yes | prompt only |
-| `_critic_forward` (per epoch) | K*B | Critic only | Yes | prompt only |
-| `_policy_log_probs` (per epoch) | K*B | Full policy | No | prompt+response |
+| `generate()` (batched) | 1 | No | No | ~T autoregressive steps |
+| `_batched_sequence_log_probs` (rollout) | 1 | No | No | prompt+response |
+| `_batched_critic_values` | 1 | No | Yes | prompt only |
+| `_critic_forward` (batched, precompute) | 1 | No (full) | Yes | prompt only |
+| `_critic_forward` (batched, per epoch) | K | Critic only | Yes | prompt only |
+| `_policy_log_probs` (batched, per epoch) | K | Full policy | No | prompt+response |
 
 ### Memory During PPO Update
 
@@ -96,7 +95,7 @@ Total for 8B bfloat16: ~48-64 GB (requires A100 80GB or gradient checkpointing)
 
 ## P1 — Per-sample rollout generation instead of batched [CRITICAL]
 
-**Status**: Open
+**Status**: **Fixed** (2026-04-08)
 **Severity**: Critical
 
 **Location:** `ppo_specs/ppo_trainer.py` (`generate_rollouts`)
@@ -142,12 +141,16 @@ with torch.no_grad():
 > **Note:** Left-padding is required for decoder-only LLMs so that attention masks
 > are aligned. `tokenizer.padding_side = "left"` must be set before the batched call.
 
+**Resolution:** `generate_rollouts` now uses a single batched `model.generate()` call
+with left-padding. `_batched_sequence_log_probs` and `_batched_critic_values` replace
+the per-sample loops. Legacy single-sample methods are kept for backward compatibility.
+
 ---
 
 ## P2 — Double forward pass per sample during PPO update [CRITICAL]
 
-**Status**: Open
-**Severity**: Critical
+**Status**: **Partially Fixed** (2026-04-08) -- `_policy_log_probs` and `_critic_forward` are now batched but still separate passes
+**Severity**: Moderate (downgraded from Critical)
 
 **Location:** `ppo_specs/ppo_trainer.py` — `_critic_forward` and `_policy_log_probs`
 both run separate forward passes on the same model.
@@ -215,7 +218,7 @@ which loads the model from disk (or HuggingFace cache).
 
 ## P4 — Sequential MC rollouts per prompt [MODERATE]
 
-**Status**: Open
+**Status**: **Fixed** (2026-04-08)
 **Severity**: Moderate
 
 **Location:** `ppo_specs/advantage.py` (`estimate_mc_advantages`)
@@ -231,24 +234,28 @@ At ~0.5 s/call = ~42 min. Batching brings this to ~2-5 min.
 
 **Fix:** Batch identical copies of the same prompt using `repeat()`.
 
+**Resolution:** `estimate_mc_advantages` now processes micro-batches of `batch_size`
+samples per prompt using `enc["input_ids"].repeat(n_batch, 1)` and
+`enc["attention_mask"].repeat(n_batch, 1)`, with left-padding for batched generation.
+
 ---
 
 ## P5 — Redundant tokenisation in `_critic_forward` [MINOR]
 
-**Status**: Open (moot after P2 fix)
+**Status**: **Fixed** (2026-04-08) -- moot; `_critic_forward` is now batched
 **Severity**: Minor
 
-**Location:** `ppo_specs/ppo_trainer.py` — `_critic_forward` re-tokenises prompts
-that are already stored as token IDs in `rollout.full_ids[:rollout.prompt_len]`.
+**Location:** `ppo_specs/ppo_trainer.py` — `_critic_forward` previously re-tokenised
+prompts that were already stored as token IDs in `rollout.full_ids[:rollout.prompt_len]`.
 
-**Fix:** Use stored token IDs directly. Becomes moot once P2 eliminates the
-separate `_critic_forward` call.
+**Resolution:** `_critic_forward` is now a single batched tokenization + forward pass
+over all prompts in the batch. The per-sample tokenization loop no longer exists.
 
 ---
 
 ## P6 — No gradient checkpointing [CLUSTER BLOCKER]
 
-**Status**: Open
+**Status**: **Fixed** (2026-04-08)
 **Severity**: Cluster Blocker
 
 **Location:** `ppo_specs/ppo_trainer.py` (`load_ppo_trainer`)
@@ -263,6 +270,10 @@ if device.type == "cuda":
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
 ```
+
+**Resolution:** `load_ppo_trainer` now enables gradient checkpointing when
+`config.gradient_checkpointing` is True. The `gradient_checkpointing` field
+was added to `PPOConfig` (default False).
 
 ---
 
@@ -279,7 +290,7 @@ if device.type == "cuda":
 
 ## P8 — `torch.float32` on GPU: 2x slower than bfloat16 [MODERATE]
 
-**Status**: Open
+**Status**: **Fixed** (2026-04-08)
 **Severity**: Moderate
 
 **Location:** `ppo_specs/ppo_trainer.py` (`load_ppo_trainer`)
@@ -288,6 +299,10 @@ if device.type == "cuda":
 ```python
 torch_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
 ```
+
+**Resolution:** `load_ppo_trainer` now auto-selects dtype via `config.torch_dtype`
+(`"auto"` = bfloat16 on GPU, float32 on CPU). The `log_softmax` computation is
+always upcast to float32 for numerical stability, even when the model is in bfloat16.
 
 ---
 
@@ -378,17 +393,18 @@ eval generation.
 
 When adapting for the cluster, apply fixes in this order:
 
-| Priority | Issue | Savings |
-|----------|-------|---------|
-| 1 | P1 — Batched rollout generation | 10-15x throughput gain |
-| 2 | P6 — Gradient checkpointing | Required to avoid OOM with 8B model |
-| 3 | P8 — bfloat16 | 2x speed + memory |
-| 4 | P9 — Reuse generation logits | Saves B full-sequence forward passes/step |
-| 5 | P2 — Combined forward pass | Saves K*B prompt-only forward passes/step |
-| 6 | P7 — Multi-GPU (accelerate) | Further parallelism |
-| 7 | P4 — Batched MC rollouts | Speeds up baseline estimation |
-| 8 | P3 — Shared model state_dict | Saves re-load time in E2.8 |
-| 9 | P10, P11 — Minor | Polish; minimal impact |
+| Priority | Issue | Savings | Status |
+|----------|-------|---------|--------|
+| 1 | P1 — Batched rollout generation | 10-15x throughput gain | **Fixed** |
+| 2 | P6 — Gradient checkpointing | Required to avoid OOM with 8B model | **Fixed** |
+| 3 | P8 — bfloat16 | 2x speed + memory | **Fixed** |
+| 4 | P9 — Reuse generation logits | Saves B full-sequence forward passes/step | Open |
+| 5 | P2 — Combined forward pass | Saves K*B prompt-only forward passes/step | Partial (batched, still separate) |
+| 6 | P7 — Multi-GPU (accelerate) | Further parallelism | Open |
+| 7 | P4 — Batched MC rollouts | Speeds up baseline estimation | **Fixed** |
+| 8 | P5 — Redundant tokenisation in critic | Moot after batching | **Fixed** |
+| 9 | P3 — Shared model state_dict | Saves re-load time in E2.8 | Open |
+| 10 | P10, P11 — Minor | Polish; minimal impact | Open |
 
 ---
 

@@ -51,6 +51,7 @@ def setup_mc_baselines(
     device: torch.device,
     n_ref_prompts: int = 5,
     temperature: float = 0.7,
+    batch_size: int = 8,
 ) -> dict[str, float]:
     """
     Estimate Monte Carlo baselines on a small reference set.
@@ -68,6 +69,8 @@ def setup_mc_baselines(
         max_new_tokens: Generation length per sample
         device:         Torch device
         n_ref_prompts:  Number of reference prompts to estimate baselines for
+        temperature:    Sampling temperature for generation
+        batch_size:     Micro-batch size for batched generation
 
     Returns:
         Dict mapping prompt string → MC mean reward
@@ -89,6 +92,7 @@ def setup_mc_baselines(
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         device=str(device),
+        batch_size=batch_size,
     )
     print("[MC] Baselines:", {k[-30:]: f"{v:.3f}" for k, v in mc_baselines.items()})
     return mc_baselines

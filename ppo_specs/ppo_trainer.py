@@ -21,6 +21,13 @@ Token-level log-probabilities are summed over the response to get
 the sequence-level log π(a|s).  The generated token ids are stored
 in the rollout buffer (avoiding re-tokenisation artefacts at the
 prompt/response boundary).
+
+Batched generation & bfloat16 support
+──────────────────────────────────────
+All per-sample loops have been converted to batched operations.
+Left-padding is used for generation; log_softmax is always computed
+in float32 for numerical stability.  Gradient checkpointing is
+supported for large models.
 """
 
 import sys
@@ -121,7 +128,7 @@ class PPOTrainer:
         self.step = 0
         self.total_rollouts = 0
 
-    # ── Rollout generation ────────────────────────────────────────────────────
+    # ── Rollout generation (batched) ─────────────────────────────────────────
 
     @torch.no_grad()
     def generate_rollouts(
@@ -130,61 +137,140 @@ class PPOTrainer:
         ground_truths: List[str],
     ) -> RolloutBatch:
         """
-        Generate one completion per prompt, compute rewards and old log probs.
-        Old log probs are computed *before* any gradient update so they
-        represent π_θ_old for the PPO ratio.
+        Batched rollout generation: one generate() call, one forward pass
+        for log-probs, one forward pass for critic values.
         """
         self.model.eval()
-        rollouts: List[Rollout] = []
+        B = len(prompts)
 
-        for prompt, gt in zip(prompts, ground_truths):
-            enc = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=512,
-                padding=False,
-            ).to(self.device)
-            prompt_len = enc["input_ids"].shape[1]
+        # Batch tokenize with left-padding
+        enc = self.tokenizer(
+            prompts, return_tensors="pt", truncation=True,
+            max_length=512, padding=True,
+        ).to(self.device)
+        prompt_lens = enc["attention_mask"].sum(dim=1).tolist()  # actual lengths per sample
 
-            # ── Generate ──────────────────────────────────────────────────────
-            out = self.model.generate(
-                **enc,
-                max_new_tokens=self.config.max_new_tokens,
-                do_sample=self.config.do_sample,
-                temperature=self.config.temperature,
-                pad_token_id=self.tokenizer.eos_token_id,
-            )
-            full_ids = out[0]  # [prompt_len + response_len]
+        # Single batched generate
+        out = self.model.generate(
+            input_ids=enc["input_ids"],
+            attention_mask=enc["attention_mask"],
+            max_new_tokens=self.config.max_new_tokens,
+            do_sample=self.config.do_sample,
+            temperature=self.config.temperature,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
 
-            # Decode response only
+        # Build rollouts from batched output
+        rollouts = []
+        for i in range(B):
+            pad_len = (enc["input_ids"][i] == self.tokenizer.pad_token_id).sum().item()
+            # With left-padding, real prompt starts at pad_len
+            real_start = pad_len
+            prompt_len = prompt_lens[i]
+            full_ids = out[i][real_start:]  # strip left-padding from output
+
             completion = self.tokenizer.decode(
                 full_ids[prompt_len:], skip_special_tokens=True
             )
-
-            # ── Old log prob ──────────────────────────────────────────────────
-            old_log_prob = self._sequence_log_prob(
-                full_ids.unsqueeze(0), prompt_len
-            ).item()
-
-            # ── Reward ────────────────────────────────────────────────────────
-            reward = self.reward_fn(completion, gt)
-
-            # ── Critic value ──────────────────────────────────────────────────
-            value = self._critic_value_no_grad(enc["input_ids"])
+            reward = self.reward_fn(completion, ground_truths[i])
 
             rollouts.append(Rollout(
-                prompt=prompt,
+                prompt=prompts[i],
                 completion=completion,
                 reward=reward,
-                old_log_prob=old_log_prob,
-                value=value,
+                old_log_prob=0.0,  # computed below in batch
+                value=0.0,         # computed below in batch
                 full_ids=full_ids.tolist(),
                 prompt_len=prompt_len,
             ))
 
-        self.total_rollouts += len(prompts)
+        # Batch compute old log probs
+        old_log_probs = self._batched_sequence_log_probs(
+            [r.full_ids for r in rollouts],
+            [r.prompt_len for r in rollouts],
+        )
+        for i, r in enumerate(rollouts):
+            r.old_log_prob = old_log_probs[i].item()
+
+        # Batch compute critic values
+        if self.critic.is_trainable():
+            critic_values = self._batched_critic_values(prompts)
+            for i, r in enumerate(rollouts):
+                r.value = critic_values[i].item()
+
+        self.total_rollouts += B
         return RolloutBatch(rollouts)
+
+    # ── Batched helper methods ───────────────────────────────────────────────
+
+    def _batched_sequence_log_probs(
+        self,
+        all_full_ids: List[List[int]],
+        prompt_lens: List[int],
+    ) -> torch.Tensor:
+        """Compute sequence log probs for all samples in one forward pass."""
+        # Pad to same length (right-pad with pad_token_id)
+        max_len = max(len(ids) for ids in all_full_ids)
+        padded = torch.full(
+            (len(all_full_ids), max_len), self.tokenizer.pad_token_id,
+            dtype=torch.long, device=self.device,
+        )
+        attention_mask = torch.zeros(
+            len(all_full_ids), max_len,
+            dtype=torch.long, device=self.device,
+        )
+        for i, ids in enumerate(all_full_ids):
+            padded[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
+            attention_mask[i, :len(ids)] = 1
+
+        outputs = self.model(
+            input_ids=padded, attention_mask=attention_mask, use_cache=False,
+        )
+        logits = outputs.logits.float()  # CRITICAL: compute log_softmax in fp32
+        log_probs = torch.log_softmax(logits, dim=-1)
+
+        # Extract per-sample response log probs
+        result = []
+        for i in range(len(all_full_ids)):
+            pl = prompt_lens[i]
+            seq_len = len(all_full_ids[i])
+            if seq_len <= pl:
+                result.append(torch.zeros(1, device=self.device))
+                continue
+            response_lp = log_probs[i, pl - 1 : seq_len - 1, :]  # [R, V]
+            response_ids = padded[i, pl:seq_len]  # [R]
+            token_lp = response_lp.gather(1, response_ids.unsqueeze(-1)).squeeze(-1)
+            result.append(token_lp.sum().unsqueeze(0))
+
+        return torch.cat(result)  # [B]
+
+    @torch.no_grad()
+    def _batched_critic_values(self, prompts: List[str]) -> torch.Tensor:
+        """Evaluate critic V(s) on all prompts in one forward pass."""
+        if not self.critic.is_trainable():
+            return torch.zeros(len(prompts), device=self.device)
+
+        enc = self.tokenizer(
+            prompts, return_tensors="pt", truncation=True,
+            max_length=512, padding=True,
+        ).to(self.device)
+
+        outputs = self.model(
+            input_ids=enc["input_ids"],
+            attention_mask=enc["attention_mask"],
+            use_cache=False,
+            output_hidden_states=True,
+        )
+
+        # Get last non-padding token's hidden state per sample
+        seq_lens = enc["attention_mask"].sum(dim=1) - 1  # index of last real token
+        last_hidden = outputs.hidden_states[-1]  # [B, S, H]
+        batch_idx = torch.arange(len(prompts), device=self.device)
+        hidden_at_last = last_hidden[batch_idx, seq_lens, :]  # [B, H]
+
+        return self.critic(hidden_at_last.float())  # critic stays fp32
+
+    # ── Legacy single-sample methods (kept for backward compatibility) ───────
 
     def _sequence_log_prob(
         self,
@@ -198,7 +284,8 @@ class PPOTrainer:
             log π(a_t | s, a_<t) = log_softmax(logits[prompt_len + t - 1])[a_t]
         """
         outputs = self.model(input_ids=input_ids, use_cache=False)
-        log_probs = torch.log_softmax(outputs.logits, dim=-1)  # [1, L, V]
+        logits = outputs.logits.float()  # upcast to fp32 for numerical stability
+        log_probs = torch.log_softmax(logits, dim=-1)  # [1, L, V]
 
         response_ids = input_ids[:, prompt_len:]           # [1, R]
         if response_ids.shape[1] == 0:
@@ -224,34 +311,40 @@ class PPOTrainer:
             output_hidden_states=True,
         )
         last_hidden = outputs.hidden_states[-1][:, -1, :]  # [1, H]
-        return self.critic(last_hidden).item()
+        return self.critic(last_hidden.float()).item()
 
-    # ── Critic evaluation on prompts ─────────────────────────────────────────
+    # ── Critic evaluation on prompts (batched) ───────────────────────────────
 
     @torch.no_grad()
     def _eval_critic_on_prompts(self, prompts: List[str]) -> np.ndarray:
-        """Evaluate critic V(s) on a list of prompts. Returns numpy array of values."""
+        """Batched critic evaluation on a list of prompts. Returns numpy array."""
         self.model.eval()
         self.critic.eval()
-        values = []
-        for prompt in prompts:
-            enc = self.tokenizer(
-                prompt, return_tensors="pt", truncation=True,
-                max_length=512, padding=False,
-            ).to(self.device)
 
-            if not self.critic.is_trainable():
-                values.append(0.0)
-            else:
-                outputs = self.model(
-                    input_ids=enc["input_ids"],
-                    use_cache=False,
-                    output_hidden_states=True,
-                )
-                last_hidden = outputs.hidden_states[-1][:, -1, :]
-                v = self.critic(last_hidden).item()
-                values.append(v)
-        return np.array(values)
+        if not self.critic.is_trainable():
+            return np.zeros(len(prompts))
+
+        enc = self.tokenizer(
+            prompts, return_tensors="pt", truncation=True,
+            max_length=512, padding=True,
+        ).to(self.device)
+
+        outputs = self.model(
+            input_ids=enc["input_ids"],
+            attention_mask=enc["attention_mask"],
+            use_cache=False,
+            output_hidden_states=True,
+        )
+
+        # Extract last real token per sample
+        # With left-padding, last real token is always at position -1
+        last_hidden = outputs.hidden_states[-1]  # [B, S, H]
+        seq_lens = enc["attention_mask"].sum(dim=1) - 1
+        batch_idx = torch.arange(len(prompts), device=self.device)
+        hidden_at_last = last_hidden[batch_idx, seq_lens, :]
+
+        values = self.critic(hidden_at_last.float())
+        return values.cpu().numpy()
 
     # ── PPO update ────────────────────────────────────────────────────────────
 
@@ -294,7 +387,7 @@ class PPOTrainer:
                 normalize=True,
             )
 
-        # ── Policy forward pass (with grad) ───────────────────────────────────
+        # ── Policy forward pass (with grad, batched) ─────────────────────────
         new_log_probs = self._policy_log_probs(batch)
 
         log_ratio = new_log_probs - old_log_probs.detach()
@@ -344,21 +437,15 @@ class PPOTrainer:
 
     def _policy_log_probs(self, batch: RolloutBatch) -> torch.Tensor:
         """
-        Recompute sequence log probs under the *current* policy (with grad).
+        Batched policy log-probs WITH gradients for PPO surrogate loss.
 
-        Uses the stored full_ids from the rollout buffer to avoid
-        re-tokenisation boundary artefacts.
+        Reconstructs the padded batch from stored rollout full_ids, runs a
+        single forward pass, and extracts per-sample sequence log-probs.
         """
-        log_probs: List[torch.Tensor] = []
-
-        for rollout in batch.rollouts:
-            full_ids = torch.tensor(
-                [rollout.full_ids], dtype=torch.long, device=self.device
-            )
-            lp = self._sequence_log_prob(full_ids, rollout.prompt_len)
-            log_probs.append(lp.squeeze(0))
-
-        return torch.stack(log_probs)  # [B]
+        return self._batched_sequence_log_probs(
+            [r.full_ids for r in batch.rollouts],
+            [r.prompt_len for r in batch.rollouts],
+        )
 
     def _critic_forward(
         self,
@@ -366,7 +453,8 @@ class PPOTrainer:
         rewards: torch.Tensor,
     ) -> Tuple[Optional[torch.Tensor], torch.Tensor]:
         """
-        Run critic on all prompts; compute MSE loss against observed returns.
+        Batched critic forward: one tokenization, one LM forward pass,
+        one critic forward pass.
 
         Hidden states are detached from the policy computation graph so the
         critic loss does not affect policy weights.
@@ -378,30 +466,28 @@ class PPOTrainer:
             return None, torch.tensor(0.0, device=self.device)
 
         self.critic.train()
-        values: List[torch.Tensor] = []
+        prompts = [r.prompt for r in batch.rollouts]
 
-        for rollout in batch.rollouts:
-            enc = self.tokenizer(
-                rollout.prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=512,
-                padding=False,
-            ).to(self.device)
+        enc = self.tokenizer(
+            prompts, return_tensors="pt", truncation=True,
+            max_length=512, padding=True,
+        ).to(self.device)
 
-            with torch.no_grad():
-                # Detach hidden states: critic loss must not flow into policy
-                outputs = self.model(
-                    input_ids=enc["input_ids"],
-                    use_cache=False,
-                    output_hidden_states=True,
-                )
-            last_hidden = outputs.hidden_states[-1][:, -1, :].detach()  # [1, H]
-            v = self.critic(last_hidden).squeeze(0)  # scalar
-            values.append(v)
+        with torch.no_grad():
+            outputs = self.model(
+                input_ids=enc["input_ids"],
+                attention_mask=enc["attention_mask"],
+                use_cache=False,
+                output_hidden_states=True,
+            )
 
-        critic_values = torch.stack(values)  # [B]
-        critic_loss = nn.functional.mse_loss(critic_values, rewards)
+        seq_lens = enc["attention_mask"].sum(dim=1) - 1
+        last_hidden = outputs.hidden_states[-1]
+        batch_idx = torch.arange(len(prompts), device=self.device)
+        hidden_at_last = last_hidden[batch_idx, seq_lens, :].detach()
+
+        critic_values = self.critic(hidden_at_last.float())
+        critic_loss = torch.nn.functional.mse_loss(critic_values, rewards)
         return critic_values, critic_loss
 
     # ── Training loop ─────────────────────────────────────────────────────────
@@ -456,30 +542,40 @@ class PPOTrainer:
         ground_truths: List[str],
         n_eval: int = 50,
     ) -> float:
-        """Greedy decoding accuracy on the first n_eval prompts."""
+        """Batched greedy decoding accuracy on the first n_eval prompts."""
         self.model.eval()
+        eval_prompts = prompts[:n_eval]
+        eval_gts = ground_truths[:n_eval]
+
+        eval_batch_size = min(8, len(eval_prompts))
         rewards: List[float] = []
 
-        for prompt, gt in zip(prompts[:n_eval], ground_truths[:n_eval]):
+        for start in range(0, len(eval_prompts), eval_batch_size):
+            batch_p = eval_prompts[start:start + eval_batch_size]
+            batch_gt = eval_gts[start:start + eval_batch_size]
+
             enc = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=512,
-                padding=False,
+                batch_p, return_tensors="pt", truncation=True,
+                max_length=512, padding=True,
             ).to(self.device)
-            prompt_len = enc["input_ids"].shape[1]
 
             out = self.model.generate(
-                **enc,
+                input_ids=enc["input_ids"],
+                attention_mask=enc["attention_mask"],
                 max_new_tokens=self.config.max_new_tokens,
-                do_sample=False,   # greedy for deterministic eval
-                pad_token_id=self.tokenizer.eos_token_id,
+                do_sample=False,  # greedy for deterministic eval
+                pad_token_id=self.tokenizer.pad_token_id,
             )
-            completion = self.tokenizer.decode(
-                out[0][prompt_len:], skip_special_tokens=True
-            )
-            rewards.append(self.reward_fn(completion, gt))
+
+            prompt_lens = enc["attention_mask"].sum(dim=1).tolist()
+            for i in range(len(batch_p)):
+                pad_len = (enc["input_ids"][i] == self.tokenizer.pad_token_id).sum().item()
+                real_start = pad_len
+                pl = prompt_lens[i]
+                completion = self.tokenizer.decode(
+                    out[i][real_start + pl:], skip_special_tokens=True
+                )
+                rewards.append(self.reward_fn(completion, batch_gt[i]))
 
         return compute_accuracy(rewards)
 
@@ -490,25 +586,44 @@ def load_ppo_trainer(config: PPOConfig, device: torch.device) -> PPOTrainer:
     """
     Load model + tokenizer from HuggingFace, build critic, return PPOTrainer.
 
-    For local smoke tests the model is loaded in float32 so it works on CPU.
-    On a GPU cluster, swap torch_dtype to torch.bfloat16 for speed.
+    Supports bfloat16 on GPU (via config.torch_dtype) and gradient
+    checkpointing for large models.  The critic is always kept in float32
+    for numerical stability.
     """
-    print(f"[PPO] Loading model: {config.model_name}  (device={device})")
+    # Determine dtype
+    if config.torch_dtype == "auto":
+        torch_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    elif config.torch_dtype == "bfloat16":
+        torch_dtype = torch.bfloat16
+    else:
+        torch_dtype = torch.float32
+
+    print(f"[PPO] Loading model: {config.model_name} (device={device}, dtype={torch_dtype})")
 
     tokenizer = AutoTokenizer.from_pretrained(config.model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # REQUIRED for batched generation
 
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        torch_dtype=torch.float32,
+        dtype=torch_dtype,
     ).to(device)
+
+    # Enable gradient checkpointing for large models
+    if config.gradient_checkpointing:
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        print("[PPO] Gradient checkpointing enabled")
 
     hidden_size = model.config.hidden_size
     print(f"[PPO] Model hidden size: {hidden_size} | "
           f"Critic capacity: {config.critic_capacity}")
 
-    critic = build_critic(config.critic_capacity, hidden_size).to(device)
+    # Keep critic in float32 even when model is bf16
+    critic = build_critic(config.critic_capacity, hidden_size)
+    critic = critic.to(device)  # stays float32
 
     return PPOTrainer(
         config=config,

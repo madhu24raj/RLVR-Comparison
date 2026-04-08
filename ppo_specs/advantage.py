@@ -69,9 +69,13 @@ def estimate_mc_advantages(
     max_new_tokens: int = 128,
     temperature: float = 0.7,
     device: str = "cpu",
+    batch_size: int = 8,
 ) -> Dict[str, float]:
     """
-    Estimate the Monte Carlo baseline E[r | prompt] for each prompt.
+    Estimate MC baselines with batched generation.
+
+    Instead of generating one sample at a time, batches multiple samples
+    for the same prompt together using input repetition.
 
     The MC baseline is the ground-truth value function under the current policy:
         V_MC(s) = (1/K) Σ_k r_k    where r_k ~ π(·|s)
@@ -87,13 +91,19 @@ def estimate_mc_advantages(
         reward_fn:     reward_fn(completion, ground_truth) -> float
         n_samples:     Rollouts per prompt (50 locally, 1000 on cluster)
         max_new_tokens: Max tokens to generate per rollout
+        temperature:   Sampling temperature
         device:        Torch device string
+        batch_size:    Micro-batch size for generation
 
     Returns:
         Dict[prompt -> MC mean reward]
     """
     policy.eval()
     mc_baselines: Dict[str, float] = {}
+
+    # Ensure left-padding for batched generation
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
 
     with torch.no_grad():
         for prompt, gt in zip(prompts, ground_truths):
@@ -105,23 +115,33 @@ def estimate_mc_advantages(
                 padding=False,
             ).to(device)
             prompt_len = enc["input_ids"].shape[1]
-            sample_rewards = []
 
-            for _ in range(n_samples):
+            sample_rewards = []
+            # Process in micro-batches
+            for start in range(0, n_samples, batch_size):
+                n_batch = min(batch_size, n_samples - start)
+                # Repeat the same prompt n_batch times
+                batch_ids = enc["input_ids"].repeat(n_batch, 1)
+                batch_mask = enc["attention_mask"].repeat(n_batch, 1)
+
                 out = policy.generate(
-                    **enc,
+                    input_ids=batch_ids,
+                    attention_mask=batch_mask,
                     max_new_tokens=max_new_tokens,
                     do_sample=True,
                     temperature=temperature,
                     pad_token_id=tokenizer.eos_token_id,
                 )
-                completion = tokenizer.decode(
-                    out[0][prompt_len:], skip_special_tokens=True
-                )
-                sample_rewards.append(reward_fn(completion, gt))
+
+                for i in range(n_batch):
+                    completion = tokenizer.decode(
+                        out[i][prompt_len:], skip_special_tokens=True
+                    )
+                    sample_rewards.append(reward_fn(completion, gt))
 
             mc_baselines[prompt] = float(np.mean(sample_rewards))
 
+    tokenizer.padding_side = original_padding_side
     return mc_baselines
 
 

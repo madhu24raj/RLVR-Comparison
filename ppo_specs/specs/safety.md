@@ -95,107 +95,59 @@ if normalize and advantages.numel() > 1:
 
 ## S4 — Empty response causes shape mismatch in `torch.stack` [MEDIUM]
 
-**Location:** `ppo_specs/ppo_trainer.py:203–205`
+**Status**: **Fixed** (2026-04-08)
 
-**Problem:**
-```python
-if response_ids.shape[1] == 0:
-    return torch.tensor(0.0, device=self.device)   # shape []
-```
-The caller `_policy_log_probs` does:
-```python
-log_probs.append(lp.squeeze(0))   # squeeze on shape [] → still shape []
-...
-return torch.stack(log_probs)     # fails if any element has shape [] vs [1]
-```
+**Location:** `ppo_specs/ppo_trainer.py`
 
-**Failure mode:** If any prompt in the batch generates zero new tokens, `torch.stack`
-raises a shape error and the entire training step crashes.
+**Problem:** Empty responses returned scalar `tensor(0.0)` (shape `[]`) causing
+`torch.stack` to fail when mixed with shape `[1]` tensors from normal responses.
 
-**Fix:**
-```python
-if response_ids.shape[1] == 0:
-    return torch.zeros(1, device=self.device)   # shape [1], consistent with normal path
-```
-Also add a warning:
-```python
-import warnings
-if response_ids.shape[1] == 0:
-    warnings.warn("Empty response generated — assigning log_prob=0.", RuntimeWarning)
-    return torch.zeros(1, device=self.device)
-```
+**Resolution:** Both `_sequence_log_prob` (legacy) and `_batched_sequence_log_probs`
+now return `torch.zeros(1, device=self.device)` for empty responses, ensuring
+consistent shape `[1]`. See also L11 in `logic.md`.
 
 ---
 
 ## S5 — Critic squeeze shape bug [MEDIUM]
 
-**Location:** `ppo_specs/ppo_trainer.py:344`
+**Status**: **Fixed** (2026-04-08) -- moot after batching
 
-**Problem:**
-```python
-v = self.critic(last_hidden).squeeze(0)
-```
-`self.critic(last_hidden)` returns shape `[1]` (batch-size 1). `.squeeze(0)` removes
-dim 0 → scalar tensor (shape `[]`). BUT if `LargeCriticMLP` or a future critic returns
-shape `[1, 1]`, `.squeeze(0)` gives `[1]`, and `torch.stack` later produces `[B, 1]`
-instead of `[B]`, causing a shape mismatch in the MSE loss.
+**Location:** `ppo_specs/ppo_trainer.py`
 
-**Fix:** Use `.squeeze()` without arguments to remove all size-1 dimensions:
-```python
-v = self.critic(last_hidden).squeeze()   # always scalar regardless of critic output shape
-```
+**Problem:** Per-sample critic loop used `.squeeze(0)` which could produce inconsistent
+shapes between critic architectures.
+
+**Resolution:** `_critic_forward` and `_batched_critic_values` now process all prompts
+in a single batched call. The critic receives `[B, H]` input and returns `[B]` values
+directly via `critic(hidden_at_last.float())`. The per-sample squeeze pattern no longer
+exists.
 
 ---
 
 ## S6 — GPU memory leak in `_policy_log_probs` [MEDIUM]
 
-**Location:** `ppo_specs/ppo_trainer.py:299–300`
+**Status**: **Fixed** (2026-04-08) -- moot after batching
 
-**Problem:**
-```python
-for rollout in batch.rollouts:
-    full_ids = torch.tensor([rollout.full_ids], dtype=torch.long, device=self.device)
-    lp = self._sequence_log_prob(full_ids, rollout.prompt_len)
-    log_probs.append(lp.squeeze(0))
-    # full_ids tensor stays on GPU until Python GC runs
-```
-Each `full_ids` tensor (up to 768 tokens × int64 = ~6 KB per sample) is created
-on GPU and not freed until CPython's GC runs, which may not happen within the training loop.
+**Location:** `ppo_specs/ppo_trainer.py`
 
-**Failure mode:** Slow VRAM growth over many steps; eventual OOM on long training runs.
+**Problem:** Per-sample loop created individual GPU tensors that were not freed promptly.
 
-**Fix:** Explicitly delete after use:
-```python
-full_ids = torch.tensor([rollout.full_ids], dtype=torch.long, device=self.device)
-lp = self._sequence_log_prob(full_ids, rollout.prompt_len)
-log_probs.append(lp.squeeze(0))
-del full_ids
-```
+**Resolution:** `_policy_log_probs` now delegates to `_batched_sequence_log_probs`
+which creates a single padded tensor for all samples. No per-sample tensor creation
+on GPU occurs.
 
 ---
 
 ## S7 — GPU memory leak in `_critic_forward` [MEDIUM]
 
-**Location:** `ppo_specs/ppo_trainer.py:328–334`
+**Status**: **Fixed** (2026-04-08) -- moot after batching
 
-**Problem:**
-```python
-for rollout in batch.rollouts:
-    enc = self.tokenizer(rollout.prompt, ...).to(self.device)
-    # enc["input_ids"] stays on GPU after the loop body
-```
-`enc` is re-created every iteration and moved to GPU, but never explicitly freed.
+**Location:** `ppo_specs/ppo_trainer.py`
 
-**Failure mode:** Same as S6 — VRAM leak during extended training.
+**Problem:** Per-sample loop created individual tokenization tensors on GPU each iteration.
 
-**Fix:**
-```python
-enc = self.tokenizer(rollout.prompt, ...).to(self.device)
-with torch.no_grad():
-    outputs = self.model(input_ids=enc["input_ids"], ...)
-del enc   # free GPU tensor immediately
-last_hidden = outputs.hidden_states[-1][:, -1, :]
-```
+**Resolution:** `_critic_forward` now performs a single batched tokenization and forward
+pass over all prompts. No per-sample GPU tensor creation occurs.
 
 ---
 
@@ -344,27 +296,26 @@ for prompt, gt in zip(prompts[:actual_n], ground_truths[:actual_n]):
 
 ## S13 — Log-prob computed over padding tokens [MEDIUM]
 
-**Location:** `ppo_specs/ppo_trainer.py:200–213`
+**Status**: **Fixed** (2026-04-08)
+
+**Location:** `ppo_specs/ppo_trainer.py`
 
 **Problem:** `generate()` may append padding tokens after EOS in some model/tokenizer
-combinations. `_sequence_log_prob` then sums log-probs over those padding tokens,
-computing an incorrect sequence probability.
+combinations. The old `_sequence_log_prob` would sum log-probs over those padding tokens.
 
-**Fix:** After generation, mask out any tokens at or after the first EOS:
-```python
-response_ids = full_ids[0, prompt_len:]
-# Find first EOS and truncate
-eos_positions = (response_ids == self.tokenizer.eos_token_id).nonzero(as_tuple=True)[0]
-if len(eos_positions) > 0:
-    response_ids = response_ids[: eos_positions[0] + 1]   # include EOS, drop trailing pad
-```
-Apply the same truncation before storing `full_ids` in the Rollout.
+**Resolution:** `_batched_sequence_log_probs` uses an `attention_mask` and per-sample
+`seq_len` tracking to extract log-probs only for real (non-padding) tokens. The
+response portion is bounded by `prompt_len` and `len(all_full_ids[i])`, which excludes
+any trailing padding. `generate_rollouts` also strips left-padding from outputs before
+storing `full_ids` in the Rollout.
 
 ---
 
 ## S14 — `torch.float32` hardcoded; breaks on bf16-only hardware [LOW]
 
-**Location:** `ppo_specs/ppo_trainer.py:420`
+**Status**: **Fixed** (2026-04-08)
+
+**Location:** `ppo_specs/ppo_trainer.py` (`load_ppo_trainer`)
 
 **Problem:**
 ```python
@@ -382,6 +333,12 @@ Also add `torch_dtype` as an optional field in `PPOConfig`:
 ```python
 torch_dtype: str = "auto"   # "float32" | "bfloat16" | "auto"
 ```
+
+**Resolution:** `load_ppo_trainer` now reads `config.torch_dtype` and auto-selects
+bfloat16 on CUDA, float32 on CPU. The `log_softmax` computation in
+`_batched_sequence_log_probs` and `_sequence_log_prob` is always performed in
+float32 (via `.float()` upcast on logits) to avoid numerical instability from
+bfloat16's reduced mantissa precision.
 
 ---
 
