@@ -1,0 +1,32 @@
+[
+  {
+    "step": 0,
+    "total_rollouts": 4,
+    "train_accuracy": 0.0,
+    "test_accuracy": 0.0,
+    "reward_variance": 0.0,
+    "policy_loss": 1.1189855337142944,
+    "critic_loss": 23.52691650390625,
+    "clip_fraction": 0.0
+  },
+  {
+    "step": 2,
+    "total_rollouts": 12,
+    "train_accuracy": 0.0,
+    "test_accuracy": 0.05,
+    "reward_variance": 0.0,
+    "policy_loss": -0.3983477056026459,
+    "critic_loss": 3.817633628845215,
+    "clip_fraction": 0.0
+  },
+  {
+    "step": 4,
+    "total_rollouts": 20,
+    "train_accuracy": 0.0,
+    "test_accuracy": 0.0,
+    "reward_variance": 0.0,
+    "policy_loss": 1.0295354127883911,
+    "critic_loss": 4.881181716918945,
+    "clip_fraction": 0.0
+  }
+]

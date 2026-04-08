@@ -19,9 +19,10 @@ class PPOConfig:
     learning_rate: float = 1e-5
     critic_lr: float = 1e-4
     clip_epsilon: float = 0.2       # PPO surrogate clipping
-    gamma: float = 0.99             # discount (single-step episodes → effectively 1)
+    gamma: float = 1.0              # single-step episodes; gamma is unused
     n_ppo_epochs: int = 1           # gradient steps per collected batch
     kl_coeff: float = 0.0           # optional KL penalty weight (off by default)
+    critic_loss_coeff: float = 0.5  # weight on critic MSE loss in total_loss
 
     # ── Rollout settings ─────────────────────────────────────────────────────
     # E2.7 spec: PPO uses 1 rollout per prompt (plus critic).

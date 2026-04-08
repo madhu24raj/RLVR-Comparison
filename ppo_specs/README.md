@@ -306,21 +306,47 @@ See `specs/performance.md` for the full priority list and code snippets.
 
 ---
 
-## Known Issues (Pre-Fix)
+## Recent Fixes (2026-04-07)
 
-The `specs/` folder documents issues found by a four-way code review.
-Critical items that affect experimental validity:
+Bugs fixed during the performance and data pipeline review:
 
-| Spec | ID | Summary |
-|------|----|---------|
-| `logic.md` | L1 | `n_ppo_epochs` ignored — only 1 gradient update per batch |
-| `logic.md` | L2 | `kl_coeff` ignored — KL penalty never applied |
-| `logic.md` | L3 | E2.7 advantage error metric uses batch-mean for all critics |
-| `logic.md` | L4 | E2.8 εV metric uses batch-mean for all critics (invalid sweep) |
-| `safety.md` | S1 | PPO ratio can overflow to `inf` without log-ratio clamping |
-| `performance.md` | P1 | Per-sample generation: ~15× slower than batched |
+| File | Fix | Severity |
+|------|-----|----------|
+| `src/rewards.py` | L10: `extract_answer_from_completion` now takes the **last** `####` match (was first), consistent with `data.py:extract_answer` | Medium |
+| `ppo_trainer.py` | L11: `_sequence_log_prob` returns `torch.zeros(1)` for empty responses (was scalar `0.0`, causing shape mismatch in `torch.stack`) | Medium |
 
-Fix these before running on the cluster or reporting experimental results.
+Previously fixed (already in codebase):
+
+| Fix | Summary |
+|-----|---------|
+| L1 | `n_ppo_epochs` loop implemented with precomputed advantages |
+| L2 | `kl_coeff * kl` applied in total loss |
+| L3/L4 | `_eval_critic_on_prompts()` used for trainable critics in E2.7/E2.8 |
+| L6 | Advantages precomputed once before K-epoch PPO loop |
+| L7 | Advantage normalization uses full z-score (mean + std) |
+| S1 | Log-ratio clamped to [-20, 20] before `exp()` |
+| S3 | Zero-std advantage normalization handled correctly |
+| TD-1 | `critic_loss_coeff` configurable (was hardcoded 0.5) |
+
+---
+
+## Known Issues
+
+The `specs/` folder documents issues found by code review.
+Items that may affect experimental validity:
+
+| Spec | ID | Summary | Severity |
+|------|----|---------|----------|
+| `logic.md` | L12 | `format_prompt` uses plain text, not chat template (confound for instruct models) | Medium |
+| `logic.md` | L13 | Reward "last number" fallback can match intermediate calculations | Low |
+| `logic.md` | L15 | `n_eval=20` during training makes convergence curves noisy | Low |
+| `performance.md` | P1 | Per-sample generation: ~10-15x slower than batched | Critical |
+| `performance.md` | P2 | Double forward pass per sample in PPO update | Critical |
+| `performance.md` | P6 | No gradient checkpointing (OOM for 8B models) | Cluster Blocker |
+| `performance.md` | P8 | float32 on GPU (2x slower than bfloat16) | Moderate |
+| `performance.md` | P9 | Generation logits discarded and recomputed | Moderate |
+
+Fix P1, P6, and P8 before running on the cluster.
 
 ---
 

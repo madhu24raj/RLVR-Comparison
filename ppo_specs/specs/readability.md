@@ -222,7 +222,34 @@ return (
 
 ---
 
-## R11 — Missing class-level docstring on `PPOConfig`
+## R11 — `format_prompt_with_template` exists but is never used
+
+**Location:** `src/data.py:56–79`
+
+**Problem:** `format_prompt_with_template()` correctly handles chat templates for
+instruction-tuned models (Qwen, Llama), but the training pipeline exclusively calls
+`format_prompt()` which uses plain text formatting. This means the more sophisticated
+function was written but never integrated.
+
+**Why it matters:** Using plain text prompts with instruction-tuned models (e.g.,
+Qwen2.5-0.5B-**Instruct**) is a potential confound. The model may perform worse
+because inputs don't match its training format. A reader would not realize this
+unless they trace through both data loading paths. See `logic.md` L12 for the
+correctness angle.
+
+**Fix:**
+1. In `run_e2_7.py` and `run_e2_8.py`, after loading the trainer, format prompts
+   using the tokenizer:
+   ```python
+   from src.data import format_prompt_with_template
+   train_prompts = [format_prompt_with_template(ex["question"], trainer.tokenizer) for ex in train_ds]
+   ```
+2. Or, if plain text is intentional for research consistency, add a comment
+   explaining the design choice.
+
+---
+
+## R12 — Missing class-level docstring on `PPOConfig`
 
 **Location:** `ppo_specs/config.py:13`
 

@@ -50,6 +50,7 @@ def setup_mc_baselines(
     max_new_tokens: int,
     device: torch.device,
     n_ref_prompts: int = 5,
+    temperature: float = 0.7,
 ) -> dict[str, float]:
     """
     Estimate Monte Carlo baselines on a small reference set.
@@ -86,6 +87,7 @@ def setup_mc_baselines(
         trainer.reward_fn,
         n_samples=n_mc,
         max_new_tokens=max_new_tokens,
+        temperature=temperature,
         device=str(device),
     )
     print("[MC] Baselines:", {k[-30:]: f"{v:.3f}" for k, v in mc_baselines.items()})

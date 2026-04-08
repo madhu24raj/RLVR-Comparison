@@ -17,7 +17,7 @@ from typing import Callable, Dict, List, Optional
 def compute_advantages(
     rewards: torch.Tensor,
     values: Optional[torch.Tensor],
-    gamma: float = 0.99,
+    gamma: float = 1.0,
     normalize: bool = True,
 ) -> torch.Tensor:
     """
@@ -45,8 +45,14 @@ def compute_advantages(
     else:
         advantages = rewards - values.detach()
 
-    if normalize and advantages.numel() > 1 and advantages.std() > 1e-8:
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+    if normalize and advantages.numel() > 1:
+        std = advantages.std()
+        if std > 1e-8:
+            advantages = (advantages - advantages.mean()) / (std + 1e-8)
+        else:
+            # All advantages identical → zero-center to produce all-zeros,
+            # which is the correct zero-gradient signal.
+            advantages = advantages - advantages.mean()
 
     return advantages
 
@@ -61,6 +67,7 @@ def estimate_mc_advantages(
     reward_fn: Callable[[str, str], float],
     n_samples: int = 50,
     max_new_tokens: int = 128,
+    temperature: float = 0.7,
     device: str = "cpu",
 ) -> Dict[str, float]:
     """
@@ -105,7 +112,7 @@ def estimate_mc_advantages(
                     **enc,
                     max_new_tokens=max_new_tokens,
                     do_sample=True,
-                    temperature=0.7,
+                    temperature=temperature,
                     pad_token_id=tokenizer.eos_token_id,
                 )
                 completion = tokenizer.decode(

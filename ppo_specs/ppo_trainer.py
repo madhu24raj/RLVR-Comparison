@@ -202,7 +202,7 @@ class PPOTrainer:
 
         response_ids = input_ids[:, prompt_len:]           # [1, R]
         if response_ids.shape[1] == 0:
-            return torch.tensor(0.0, device=self.device)
+            return torch.zeros(1, device=self.device)
 
         # logits at positions [prompt_len-1 : L-1] predict tokens [prompt_len : L]
         response_log_probs = log_probs[:, prompt_len - 1 : -1, :]  # [1, R, V]
@@ -226,15 +226,53 @@ class PPOTrainer:
         last_hidden = outputs.hidden_states[-1][:, -1, :]  # [1, H]
         return self.critic(last_hidden).item()
 
+    # ── Critic evaluation on prompts ─────────────────────────────────────────
+
+    @torch.no_grad()
+    def _eval_critic_on_prompts(self, prompts: List[str]) -> np.ndarray:
+        """Evaluate critic V(s) on a list of prompts. Returns numpy array of values."""
+        self.model.eval()
+        self.critic.eval()
+        values = []
+        for prompt in prompts:
+            enc = self.tokenizer(
+                prompt, return_tensors="pt", truncation=True,
+                max_length=512, padding=False,
+            ).to(self.device)
+
+            if not self.critic.is_trainable():
+                values.append(0.0)
+            else:
+                outputs = self.model(
+                    input_ids=enc["input_ids"],
+                    use_cache=False,
+                    output_hidden_states=True,
+                )
+                last_hidden = outputs.hidden_states[-1][:, -1, :]
+                v = self.critic(last_hidden).item()
+                values.append(v)
+        return np.array(values)
+
     # ── PPO update ────────────────────────────────────────────────────────────
 
-    def ppo_update(self, batch: RolloutBatch) -> Dict[str, float]:
+    def ppo_update(
+        self,
+        batch: RolloutBatch,
+        precomputed_advantages: Optional[torch.Tensor] = None,
+    ) -> Dict[str, float]:
         """
         One PPO gradient step on the collected batch.
 
         Policy and critic losses are computed jointly but gradients are
         separated: critic hidden states are detached from the policy graph
         so L_V does not backpropagate into policy weights.
+
+        Args:
+            batch: Rollout data collected under pi_old.
+            precomputed_advantages: If provided, these fixed advantages are
+                used instead of recomputing from the (now-updated) critic.
+                Standard PPO computes advantages once before the K-epoch
+                optimisation loop (Schulman et al., 2017 Section 4).
         """
         self.model.train()
 
@@ -245,25 +283,38 @@ class PPOTrainer:
         critic_values, critic_loss = self._critic_forward(batch, rewards)
 
         # ── Advantages ───────────────────────────────────────────────────────
-        values_for_adv = critic_values.detach() if critic_values is not None else None
-        advantages = compute_advantages(
-            rewards,
-            values_for_adv,
-            gamma=self.config.gamma,
-            normalize=True,
-        )
+        if precomputed_advantages is not None:
+            advantages = precomputed_advantages.detach()
+        else:
+            values_for_adv = critic_values.detach() if critic_values is not None else None
+            advantages = compute_advantages(
+                rewards,
+                values_for_adv,
+                gamma=self.config.gamma,
+                normalize=True,
+            )
 
         # ── Policy forward pass (with grad) ───────────────────────────────────
         new_log_probs = self._policy_log_probs(batch)
 
-        ratio = torch.exp(new_log_probs - old_log_probs.detach())
+        log_ratio = new_log_probs - old_log_probs.detach()
+        log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
+        ratio = torch.exp(log_ratio)
         clipped = torch.clamp(
             ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon
         )
         policy_loss = -torch.mean(torch.min(ratio * advantages, clipped * advantages))
 
+        # ── KL divergence penalty ─────────────────────────────────────────────
+        # KL(pi_old || pi_new) = E_{pi_old}[log pi_old - log pi_new]
+        # This is the correct direction: penalises the new policy for
+        # moving away from the old policy under which data was collected.
+        kl = (old_log_probs.detach() - new_log_probs).mean()
+
         # ── Combined loss and backward ────────────────────────────────────────
-        total_loss = policy_loss + 0.5 * critic_loss
+        total_loss = (policy_loss
+                      + self.config.critic_loss_coeff * critic_loss
+                      + self.config.kl_coeff * kl)
 
         self.policy_optimizer.zero_grad()
         if self.critic_optimizer:
@@ -272,17 +323,22 @@ class PPOTrainer:
         total_loss.backward()
 
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        if self.critic.is_trainable():
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
         self.policy_optimizer.step()
         if self.critic_optimizer:
             self.critic_optimizer.step()
 
+        # Use detached ratio for metrics to avoid retaining the computation graph
+        ratio_detached = ratio.detach()
         return {
             "policy_loss": policy_loss.item(),
             "critic_loss": critic_loss.item(),
+            "kl_divergence": kl.item(),
             "mean_reward": rewards.mean().item(),
             "reward_variance": rewards.var().item(),
             "mean_advantage": advantages.mean().item(),
-            "clip_fraction": ((ratio - 1.0).abs() > self.config.clip_epsilon)
+            "clip_fraction": ((ratio_detached - 1.0).abs() > self.config.clip_epsilon)
                              .float().mean().item(),
         }
 
@@ -355,15 +411,43 @@ class PPOTrainer:
         prompts: List[str],
         ground_truths: List[str],
     ) -> Dict[str, float]:
-        """Single PPO iteration: collect rollouts → update policy & critic."""
+        """Single PPO iteration: collect rollouts → K gradient updates.
+
+        Advantages are computed ONCE from the initial critic values and held
+        fixed across all K PPO epochs, matching the standard PPO algorithm
+        (Schulman et al., 2017).  Recomputing advantages each epoch with
+        updated critic weights would introduce a moving optimisation target.
+        """
         batch = self.generate_rollouts(prompts, ground_truths)
-        metrics = self.ppo_update(batch)
-        metrics["accuracy"] = compute_accuracy(
+
+        # ── Compute advantages once, before any gradient updates ─────────
+        rewards = batch.rewards().to(self.device)
+        with torch.no_grad():
+            critic_values_init, _ = self._critic_forward(batch, rewards)
+        values_for_adv = critic_values_init.detach() if critic_values_init is not None else None
+        fixed_advantages = compute_advantages(
+            rewards,
+            values_for_adv,
+            gamma=self.config.gamma,
+            normalize=True,
+        )
+
+        all_metrics: List[Dict[str, float]] = []
+        for epoch in range(self.config.n_ppo_epochs):
+            metrics = self.ppo_update(batch, precomputed_advantages=fixed_advantages)
+            all_metrics.append(metrics)
+
+        # Average scalar metrics over epochs
+        aggregated = {
+            k: float(np.mean([m[k] for m in all_metrics]))
+            for k in all_metrics[0]
+        }
+        aggregated["accuracy"] = compute_accuracy(
             [r.reward for r in batch.rollouts]
         )
-        metrics["total_rollouts"] = self.total_rollouts
+        aggregated["total_rollouts"] = self.total_rollouts
         self.step += 1
-        return metrics
+        return aggregated
 
     @torch.no_grad()
     def evaluate(

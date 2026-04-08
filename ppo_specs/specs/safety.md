@@ -403,3 +403,133 @@ the tensor would otherwise carry a gradient.
 ```python
 last_hidden = outputs.hidden_states[-1][:, -1, :]   # no_grad() already stops graph
 ```
+
+---
+
+## S16 — Log-ratio clamp at ±20 is extremely loose [LOW]
+
+### ID: S16
+**Status**: Open (by design)
+**Severity**: Low
+**Description**: The log-ratio is clamped to [-20, 20] before exponentiation.
+`exp(20) ≈ 4.85e8`, which is an astronomically large policy ratio. The PPO clip
+at ε=0.2 means the gradient only flows through ratios in [0.8, 1.2]. Any ratio
+outside this range is clipped to 1±ε anyway, so the log-ratio clamp at ±20 is
+purely a NaN-prevention safety net, not a functional constraint.
+
+**Analysis**: A tighter clamp (e.g., ±5, where exp(5)≈148) would still be far
+outside the useful range and would provide earlier protection against numerical
+issues. However, since the current clamp is correct and the PPO clip handles
+the functional constraint, this is cosmetic. No change needed unless training
+exhibits instability from very large (but not infinite) ratios.
+
+---
+
+## S17 — Potential gradient graph retention in metrics dictionary [LOW]
+
+### ID: S17
+**Status**: Fixed
+**Severity**: Low
+**Description**: In `ppo_update`, the clip_fraction metric was computed using
+`ratio` which had gradients attached. Although `.item()` was called (extracting
+a Python float), the intermediate computation `(ratio - 1.0).abs()` created
+temporary tensors on the computation graph, which could delay memory freeing.
+
+**Fix**: Now uses `ratio.detach()` before computing clip_fraction.
+
+---
+
+## Deep Review — Numerical Stability Assessment
+
+### Sequence-level log-prob accumulation
+
+`_sequence_log_prob` sums per-token log-probs over the full response. For long
+responses (e.g., 256 tokens), this sum can be very negative (e.g., -500). The
+difference `new_log_prob - old_log_prob` is then computed between two large
+negative numbers, which can lose precision. However, since both are computed
+from the same token sequence with similar models, the difference is typically
+small (within ±10), so this is acceptable.
+
+The use of `torch.log_softmax` (fused log+softmax) is numerically stable,
+avoiding the separate `log(softmax(x))` pattern that can produce `-inf` for
+rare tokens.
+
+### Advantage normalization edge cases
+
+The updated normalization handles three cases:
+1. Normal: `(A - mean) / (std + eps)` -- full z-score
+2. Zero-std (all advantages equal): `A - mean` = all zeros -- correct zero gradient
+3. Single element: normalization skipped -- correct (no meaningful statistics)
+
+This is robust against all batch compositions including all-correct, all-incorrect,
+and single-sample batches.
+
+---
+
+## Training Dynamics Safety Review
+
+### TD-S1: Optimizer gradient isolation verified
+**Status**: Verified Safe
+**Severity**: N/A (verification)
+**Description**: With separate optimizers for policy and critic, `total_loss.backward()`
+computes gradients for ALL parameters in the computation graph. The question is whether
+each optimizer only updates the correct parameters.
+
+**Analysis**:
+- `policy_optimizer` is constructed over `model.parameters()`. After `backward()`,
+  `model.parameters()` have `.grad` populated from policy_loss + kl terms only
+  (critic_loss contributes zero gradient to model params due to `torch.no_grad()` +
+  `.detach()` in `_critic_forward`). `policy_optimizer.step()` updates model params
+  with the correct gradients.
+- `critic_optimizer` is constructed over `critic.parameters()`. After `backward()`,
+  `critic.parameters()` have `.grad` populated from critic_loss only (policy_loss
+  and kl contribute zero gradient to critic params since they don't involve critic
+  parameters). `critic_optimizer.step()` updates critic params with correct gradients.
+- There is NO cross-contamination: each optimizer only sees gradients from the correct
+  loss terms. The single `backward()` call is efficient and correct.
+
+### TD-S2: Critic loss coefficient now configurable (was hardcoded)
+**Status**: Fixed
+**Severity**: Medium
+**Description**: The critic loss coefficient was hardcoded as 0.5 in `ppo_update`.
+If a researcher wanted to adjust the relative weight of critic training, they had to
+modify source code. This was also undocumented, making it easy to miss in a paper.
+
+**Fix**: Added `critic_loss_coeff: float = 0.5` to `PPOConfig`. The `ppo_update`
+method now reads `self.config.critic_loss_coeff` instead of the hardcoded 0.5.
+
+### TD-S3: No learning rate warmup (risk assessment)
+**Status**: Open
+**Severity**: Low
+**Description**: Both policy and critic optimizers start at their full learning rates
+from step 0. For LLM fine-tuning, a linear warmup over 5-10% of total steps is
+standard practice to prevent large initial gradient updates that could destabilize
+the pretrained representations.
+
+**Analysis**: For the current experiment settings (100-200 steps, batch_size=8-16,
+lr=1e-5), the risk is low:
+- The learning rate 1e-5 is already conservative.
+- PPO's clipping mechanism bounds the effective policy change per step.
+- The gradient clipping (max_norm=1.0) provides additional protection.
+
+For cluster runs with larger batches or higher learning rates, adding warmup is
+recommended. Add `warmup_steps: int = 0` to PPOConfig and create a
+`torch.optim.lr_scheduler.LinearLR` scheduler if warmup_steps > 0.
+
+### TD-S4: Binary reward special considerations
+**Status**: Verified Safe
+**Severity**: N/A (verification)
+**Description**: With binary rewards {0,1}, several aspects of the training dynamics
+differ from continuous-reward settings.
+
+**Analysis**:
+- **Advantage distribution**: For batch_size=8 with binary rewards, advantages can
+  only take a small number of distinct values. Normalization via z-score is still
+  meaningful as long as at least one correct and one incorrect response exist.
+- **Critic targets**: The critic learns to predict E[r|s] which is a probability in
+  [0,1]. MSE loss is appropriate and bounded.
+- **Reward variance**: `rewards.var()` with binary rewards equals p(1-p) where p is
+  accuracy. This is a useful training stability metric.
+- **All-same batches**: When all rewards are 0 or all are 1, advantages are all zero
+  after normalization, producing zero policy gradient. This is correct -- there is no
+  signal about which responses are better.

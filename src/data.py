@@ -53,6 +53,32 @@ def format_prompt(question: str, system_prompt: str = None) -> str:
     return f"{system_prompt}\n\nQuestion: {question}\n\nAnswer:"
 
 
+def format_prompt_with_template(question: str, tokenizer=None, system_prompt: str = None) -> str:
+    """Format a GSM8K question using the model's chat template.
+
+    Falls back to plain text format if tokenizer is None or has no chat template.
+    """
+    if system_prompt is None:
+        system_prompt = (
+            "Solve this math problem step by step. "
+            "Put your final numerical answer after ####."
+        )
+
+    if tokenizer is not None and hasattr(tokenizer, 'apply_chat_template'):
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ]
+        try:
+            return tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            pass  # fall back to plain format
+
+    return f"{system_prompt}\n\nQuestion: {question}\n\nAnswer:"
+
+
 def get_experiment_subset(n: int = 100, seed: int = 42):
     """Get the standard 100-prompt subset used across all experiments.
 

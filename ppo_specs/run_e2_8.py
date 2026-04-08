@@ -43,8 +43,10 @@ import argparse
 import json
 from pathlib import Path
 
+import random
 import torch
 import numpy as np
+from transformers import set_seed as transformers_set_seed
 
 from src.data import load_gsm8k, format_prompt
 from eval.metrics import ExperimentLogger
@@ -55,18 +57,9 @@ from ppo_specs.advantage import (
     advantage_estimation_error,
     critic_approximation_error,
 )
+from ppo_specs.utils import cycle_batch
 
 ALL_CAPACITIES = ["none", "small", "medium", "large"]
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _cycle_batch(items: list, step: int, batch_size: int) -> list:
-    n = len(items)
-    start = (step * batch_size) % n
-    if start + batch_size <= n:
-        return items[start : start + batch_size]
-    return items[start:] + items[: (start + batch_size) - n]
 
 
 # ── Single capacity run ───────────────────────────────────────────────────────
@@ -104,8 +97,8 @@ def run_one_capacity(
     bias_samples:   list[float] = []   # advantage bias per eval step
 
     for step in range(cfg.n_steps):
-        batch_p  = _cycle_batch(train_prompts, step, cfg.batch_size)
-        batch_gt = _cycle_batch(train_gts,     step, cfg.batch_size)
+        batch_p  = cycle_batch(train_prompts, step, cfg.batch_size)
+        batch_gt = cycle_batch(train_gts,     step, cfg.batch_size)
 
         metrics = trainer.train_step(batch_p, batch_gt)
 
@@ -114,19 +107,29 @@ def run_one_capacity(
             accuracy_curve.append((metrics["total_rollouts"], test_acc))
 
             # (ii) εV: compare critic baseline vs MC ground truth
+            # NOTE: MC baselines are from the initial policy. As training
+            # progresses this measures tracking of the initial value function.
+            # See logic.md L6 for discussion.
             ev = float("nan")
             bias = float("nan")
             if mc_baselines:
                 mc_vals = np.array(list(mc_baselines.values()))
+                ref_prompts_for_eval = list(mc_baselines.keys())
 
                 if capacity == "none":
-                    # Batch-mean baseline
-                    est_vals = np.full(len(mc_vals), metrics["mean_reward"])
+                    # Generate rollouts on the SAME reference prompts used for
+                    # MC estimation, and use their mean as the REINFORCE baseline.
+                    # This avoids comparing batch-mean on arbitrary prompts vs
+                    # MC on reference prompts (apples-to-oranges).
+                    saved_rollouts = trainer.total_rollouts
+                    ref_batch = trainer.generate_rollouts(
+                        ref_prompts_for_eval, train_gts[:5]
+                    )
+                    trainer.total_rollouts = saved_rollouts  # don't corrupt budget
+                    ref_mean = float(ref_batch.rewards().mean())
+                    est_vals = np.full(len(mc_vals), ref_mean)
                 else:
-                    # Use mean reward as a proxy for critic output
-                    # (exact critic values would require running critic.forward
-                    #  on the reference prompts – cheaper proxy suffices here)
-                    est_vals = np.full(len(mc_vals), metrics["mean_reward"])
+                    est_vals = trainer._eval_critic_on_prompts(ref_prompts_for_eval)
 
                 ev   = critic_approximation_error(est_vals, mc_vals)
                 bias = advantage_estimation_error(est_vals, mc_vals)
@@ -169,6 +172,13 @@ def run_one_capacity(
 
 def run_e2_8(config: PPOConfig, capacities: list[str]) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Full reproducibility: seed all RNGs including transformers' internal state
+    random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
+    transformers_set_seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.seed)
     print(f"[E2.8] Device: {device}")
 
     # ── Shared data ───────────────────────────────────────────────────────────
@@ -195,6 +205,7 @@ def run_e2_8(config: PPOConfig, capacities: list[str]) -> None:
         ref_p, ref_gt, tmp_trainer.reward_fn,
         n_samples=n_mc,
         max_new_tokens=config.max_new_tokens,
+        temperature=config.temperature,
         device=str(device),
     )
     del tmp_trainer  # free VRAM before sweep

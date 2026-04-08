@@ -33,32 +33,30 @@ import argparse
 import json
 from pathlib import Path
 
+import random
 import torch
 import numpy as np
+from transformers import set_seed as transformers_set_seed
 
 from src.data import load_gsm8k, format_prompt
 from eval.metrics import ExperimentLogger
 from ppo_specs.config import PPOConfig, local_test_config, e2_7_config
 from ppo_specs.ppo_trainer import load_ppo_trainer
 from ppo_specs.advantage import estimate_mc_advantages, advantage_estimation_error
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _cycle_batch(items: list, step: int, batch_size: int) -> list:
-    """Return a contiguous slice of length batch_size, wrapping around."""
-    n = len(items)
-    start = (step * batch_size) % n
-    if start + batch_size <= n:
-        return items[start : start + batch_size]
-    # wrap
-    return items[start:] + items[: (start + batch_size) - n]
+from ppo_specs.utils import cycle_batch
 
 
 # ── Main experiment ───────────────────────────────────────────────────────────
 
 def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Full reproducibility: seed all RNGs including transformers' internal state
+    random.seed(config.seed)
+    torch.manual_seed(config.seed)
+    np.random.seed(config.seed)
+    transformers_set_seed(config.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(config.seed)
     print(f"[E2.7] Device: {device}")
 
     # ── Data ─────────────────────────────────────────────────────────────────
@@ -88,6 +86,7 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
             ref_p, ref_gt, trainer.reward_fn,
             n_samples=n_mc,
             max_new_tokens=config.max_new_tokens,
+            temperature=config.temperature,
             device=str(device),
         )
         print("[E2.7] MC baselines:", {k[-30:]: f"{v:.3f}" for k, v in mc_baselines.items()})
@@ -97,8 +96,8 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
     reward_window: list[float] = []  # rolling window for variance (stability)
 
     for step in range(config.n_steps):
-        batch_p  = _cycle_batch(train_prompts, step, config.batch_size)
-        batch_gt = _cycle_batch(train_gts,     step, config.batch_size)
+        batch_p  = cycle_batch(train_prompts, step, config.batch_size)
+        batch_gt = cycle_batch(train_gts,     step, config.batch_size)
 
         metrics = trainer.train_step(batch_p, batch_gt)
         reward_window.append(metrics["mean_reward"])
@@ -121,12 +120,34 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
             stability = float(np.var(window))
 
             # (iv) Advantage estimation error
+            # NOTE: MC baselines were estimated from the INITIAL policy.
+            # As training progresses, V(s) under the current policy diverges
+            # from V_MC(s) under the initial policy.  This metric therefore
+            # measures critic tracking of the initial-policy value function.
+            # See logic.md L6 for discussion of this limitation.
             adv_error = None
             if mc_baselines:
-                # Current critic baseline estimate: mean reward of this batch
-                est = np.full(len(mc_baselines), metrics["mean_reward"])
-                mc  = np.array(list(mc_baselines.values()))
-                adv_error = advantage_estimation_error(est, mc)
+                mc_vals = np.array(list(mc_baselines.values()))
+                ref_p_for_eval = list(mc_baselines.keys())
+
+                if config.critic_capacity == "none":
+                    # REINFORCE uses batch-mean reward as baseline.  To compare
+                    # fairly against MC baselines on the SAME reference prompts,
+                    # we generate rollouts on those prompts and take their mean.
+                    # This avoids the apples-to-oranges error of comparing
+                    # batch-mean on arbitrary current prompts vs MC on reference
+                    # prompts.
+                    # Note: we temporarily generate without incrementing
+                    # total_rollouts so the rollout budget metric stays clean.
+                    saved_rollouts = trainer.total_rollouts
+                    ref_batch = trainer.generate_rollouts(ref_p_for_eval, train_gts[:5])
+                    trainer.total_rollouts = saved_rollouts  # undo count
+                    ref_mean = float(ref_batch.rewards().mean())
+                    est = np.full(len(mc_vals), ref_mean)
+                else:
+                    est = trainer._eval_critic_on_prompts(ref_p_for_eval)
+
+                adv_error = advantage_estimation_error(est, mc_vals)
 
             log_entry: dict = {
                 "total_rollouts": metrics["total_rollouts"],   # (iii) x-axis

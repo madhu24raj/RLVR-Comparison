@@ -19,10 +19,13 @@ def extract_answer_from_completion(completion: str) -> str:
 
     Returns None if no number is found.
     """
-    # Try #### format first (most reliable)
-    match = re.search(r"####\s*(-?[\d,]+\.?\d*)", completion)
-    if match:
-        return match.group(1).replace(",", "")
+    # Try #### format first (most reliable).
+    # Use findall + take last match: consistent with data.py extract_answer
+    # which uses split("####")[-1]. If the model outputs multiple ####
+    # markers (e.g. in reasoning), we want the final one.
+    hash_matches = re.findall(r"####\s*(-?[\d,]+\.?\d*)", completion)
+    if hash_matches:
+        return hash_matches[-1].replace(",", "")
 
     # Try \boxed{} format
     match = re.search(r"\\boxed\{([^}]+)\}", completion)
@@ -51,6 +54,8 @@ def normalize_number(s: str) -> float:
 
     Handles integers, floats, and comma-separated numbers.
     """
+    if s is None:
+        return None
     try:
         return float(s.replace(",", ""))
     except (ValueError, TypeError):
