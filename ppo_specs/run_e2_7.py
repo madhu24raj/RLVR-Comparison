@@ -157,7 +157,8 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
                 f"  step {step:3d} | reward={metrics['mean_reward']:.3f} "
                 f"| acc={metrics['accuracy']:.3f} "
                 f"| policy_loss={metrics['policy_loss']:.4f} "
-                f"| critic_loss={metrics['critic_loss']:.4f}"
+                f"| critic_loss={metrics['critic_loss']:.4f} "
+                f"| kl={metrics['kl_divergence']:.4f}"
             )
 
         # ── Periodic evaluation ───────────────────────────────────────────────
@@ -207,6 +208,8 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
                 "policy_loss":    metrics["policy_loss"],
                 "critic_loss":    metrics["critic_loss"],
                 "clip_fraction":  metrics["clip_fraction"],
+                "kl_divergence":  metrics["kl_divergence"],
+                "kl_ref_divergence": metrics["kl_ref_divergence"],
             }
             if adv_error is not None:
                 log_entry["advantage_error"] = adv_error       # (iv)
