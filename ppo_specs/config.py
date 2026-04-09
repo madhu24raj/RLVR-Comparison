@@ -35,7 +35,12 @@ class PPOConfig:
     critic_lr: float = 1e-4
     clip_epsilon: float = 0.2       # PPO surrogate clipping
     gamma: float = 1.0              # single-step episodes; gamma is unused
-    n_ppo_epochs: int = 1           # gradient steps per collected batch
+    n_ppo_epochs: int = 4           # PPO epochs per collected batch (TRL/InstructGPT
+                                     # standard). With per-token PPO loss the surrogate
+                                     # is well-behaved at K>=2; at K=1 the ratio is
+                                     # identically 1.0 on the first pass so the printed
+                                     # policy_loss is ~0 (gradient is still real;
+                                     # see policy_grad_norm metric).
     kl_coeff: float = 0.0           # optional KL penalty weight (off by default)
     critic_loss_coeff: float = 0.5  # weight on critic MSE loss in total_loss
     grad_clip_norm: float = 1.0     # max gradient norm for policy and critic

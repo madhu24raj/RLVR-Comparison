@@ -729,3 +729,176 @@ class TestEvalCriticOnPrompts:
             assert np.all(np.isfinite(result)), (
                 f"{label} critic: non-finite values {result}"
             )
+
+
+# ===========================================================================
+# 8. Per-token PPO log-prob contract (regression tests for the per-token fix)
+# ===========================================================================
+
+
+class TestPerTokenLogProbsContract:
+    """Locks in the shape + mask contract of _batched_per_token_log_probs.
+
+    This is the source of truth for the PPO loss after the per-token
+    refactor. We verify:
+      1. Shape: (log_probs[B, T], mask[B, T]) where T = max response length.
+      2. Mask correctness: mask.sum(dim=-1) per sample matches the actual
+         response length (full_len - prompt_len).
+      3. Sum equivalence: (per_token * mask).sum(dim=-1) reproduces the
+         legacy sequence-level _batched_sequence_log_probs to float precision.
+    """
+
+    @staticmethod
+    def _build_inputs(tokenizer, prompts, completions):
+        """Helper: build (full_ids, prompt_lens) lists from prompt/completion pairs."""
+        all_full_ids = []
+        prompt_lens = []
+        resp_lens = []
+        for prompt, comp in zip(prompts, completions):
+            prompt_ids = tokenizer.encode(prompt, add_special_tokens=True)
+            comp_ids = tokenizer.encode(comp, add_special_tokens=False)
+            all_full_ids.append(prompt_ids + comp_ids)
+            prompt_lens.append(len(prompt_ids))
+            resp_lens.append(len(comp_ids))
+        return all_full_ids, prompt_lens, resp_lens
+
+    @pytest.mark.slow
+    def test_returns_per_token_shape_and_mask(self, trainer_medium, shared_model_and_tokenizer):
+        """Returns (log_probs, mask) both [B, T_max_response]."""
+        _, tokenizer = shared_model_and_tokenizer
+        prompts = VARYING_PROMPTS[:3]
+        # Deliberately varying response lengths to exercise the mask.
+        completions = [
+            " 4",
+            " The result is 8.",
+            " Adding seven and twelve gives nineteen, so the answer is 19.",
+        ]
+        all_full_ids, prompt_lens, resp_lens = self._build_inputs(
+            tokenizer, prompts, completions,
+        )
+
+        with torch.no_grad():
+            per_token, mask = trainer_medium._batched_per_token_log_probs(
+                all_full_ids, prompt_lens,
+            )
+
+        B = len(prompts)
+        T_max = max(resp_lens)
+        assert per_token.shape == (B, T_max), (
+            f"per_token shape {per_token.shape} != ({B}, {T_max})"
+        )
+        assert mask.shape == (B, T_max), (
+            f"mask shape {mask.shape} != ({B}, {T_max})"
+        )
+
+    @pytest.mark.slow
+    def test_mask_sum_equals_response_length(self, trainer_medium, shared_model_and_tokenizer):
+        """Per-sample mask.sum() must equal that sample's response length."""
+        _, tokenizer = shared_model_and_tokenizer
+        prompts = VARYING_PROMPTS[:3]
+        completions = [
+            " 4",
+            " The result is 8.",
+            " Adding seven and twelve gives nineteen, so the answer is 19.",
+        ]
+        all_full_ids, prompt_lens, resp_lens = self._build_inputs(
+            tokenizer, prompts, completions,
+        )
+
+        with torch.no_grad():
+            _, mask = trainer_medium._batched_per_token_log_probs(
+                all_full_ids, prompt_lens,
+            )
+
+        per_sample_mask_sums = mask.sum(dim=-1).cpu().tolist()
+        for i, (got, expected) in enumerate(zip(per_sample_mask_sums, resp_lens)):
+            assert int(got) == expected, (
+                f"sample {i}: mask sum {got} != response length {expected}"
+            )
+
+    @pytest.mark.slow
+    def test_mask_is_strictly_left_aligned(self, trainer_medium, shared_model_and_tokenizer):
+        """Mask must be 1s followed by 0s on each row (no gaps)."""
+        _, tokenizer = shared_model_and_tokenizer
+        prompts = VARYING_PROMPTS[:3]
+        completions = [
+            " 4",
+            " The result is 8.",
+            " Adding seven and twelve gives nineteen, so the answer is 19.",
+        ]
+        all_full_ids, prompt_lens, _ = self._build_inputs(
+            tokenizer, prompts, completions,
+        )
+
+        with torch.no_grad():
+            _, mask = trainer_medium._batched_per_token_log_probs(
+                all_full_ids, prompt_lens,
+            )
+
+        # For every row, all-ones followed by all-zeros: cumsum then verify
+        # each transition is monotonic non-decreasing on the *complement*.
+        for i in range(mask.shape[0]):
+            row = mask[i].cpu().tolist()
+            seen_zero = False
+            for j, v in enumerate(row):
+                if v == 0:
+                    seen_zero = True
+                elif seen_zero:
+                    raise AssertionError(
+                        f"row {i}: mask has a 1 at pos {j} after a 0 (not left-aligned)"
+                    )
+
+    @pytest.mark.slow
+    def test_sum_equals_legacy_sequence_log_prob(self, trainer_medium, shared_model_and_tokenizer):
+        """Summing per-token (with mask) reproduces _batched_sequence_log_probs.
+
+        This guarantees the per-token refactor did not perturb the sequence-
+        level numbers that downstream tests assert against.
+        """
+        _, tokenizer = shared_model_and_tokenizer
+        prompts = VARYING_PROMPTS  # all 4
+        completions = [
+            " 4",
+            " 8",
+            " The answer is 19 because 7+12=19.",
+            " 4",
+        ]
+        all_full_ids, prompt_lens, _ = self._build_inputs(
+            tokenizer, prompts, completions,
+        )
+
+        with torch.no_grad():
+            per_token, mask = trainer_medium._batched_per_token_log_probs(
+                all_full_ids, prompt_lens,
+            )
+            summed = (per_token * mask).sum(dim=-1).cpu().float()
+
+            legacy = trainer_medium._batched_sequence_log_probs(
+                all_full_ids, prompt_lens,
+            ).cpu().float()
+
+        torch.testing.assert_close(summed, legacy, atol=1e-5, rtol=1e-5)
+
+    @pytest.mark.slow
+    def test_log_probs_are_finite_and_negative(self, trainer_medium, shared_model_and_tokenizer):
+        """All masked positions should be finite and < 0 (real log probs)."""
+        _, tokenizer = shared_model_and_tokenizer
+        prompts = VARYING_PROMPTS[:3]
+        completions = [" 4", " 8", " 19"]
+        all_full_ids, prompt_lens, _ = self._build_inputs(
+            tokenizer, prompts, completions,
+        )
+
+        with torch.no_grad():
+            per_token, mask = trainer_medium._batched_per_token_log_probs(
+                all_full_ids, prompt_lens,
+            )
+
+        # Look only at positions where the mask is 1
+        masked_vals = per_token[mask.bool()]
+        assert torch.isfinite(masked_vals).all(), (
+            f"Non-finite log probs at masked positions: {masked_vals.tolist()}"
+        )
+        assert (masked_vals < 0).all(), (
+            f"Expected all negative log probs, got: {masked_vals.tolist()}"
+        )
