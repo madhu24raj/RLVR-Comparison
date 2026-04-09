@@ -38,7 +38,7 @@ import torch
 import numpy as np
 from transformers import set_seed as transformers_set_seed
 
-from src.data import load_gsm8k, format_prompt
+from src.data import load_gsm8k, format_prompt_with_template
 from eval.metrics import ExperimentLogger
 from ppo_specs.config import PPOConfig, local_test_config, e2_7_config
 from ppo_specs.ppo_trainer import load_ppo_trainer
@@ -66,15 +66,21 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
     # ── Data ─────────────────────────────────────────────────────────────────
     print("[E2.7] Loading GSM8K …")
     train_ds = load_gsm8k("train", n_samples=config.n_train_samples, seed=config.seed)
-    test_ds  = load_gsm8k("test",  n_samples=200)
+    test_ds  = load_gsm8k("test",  n_samples=config.n_test_samples)
 
-    train_prompts = [format_prompt(ex["question"]) for ex in train_ds]
     train_gts     = [ex["ground_truth"] for ex in train_ds]
-    test_prompts  = [format_prompt(ex["question"]) for ex in test_ds]
     test_gts      = [ex["ground_truth"] for ex in test_ds]
 
     # ── Trainer ───────────────────────────────────────────────────────────────
+    # Loaded before prompt formatting so we can use the model's chat template (L12).
     trainer = load_ppo_trainer(config, device)
+
+    train_prompts = [
+        format_prompt_with_template(ex["question"], trainer.tokenizer) for ex in train_ds
+    ]
+    test_prompts  = [
+        format_prompt_with_template(ex["question"], trainer.tokenizer) for ex in test_ds
+    ]
 
     # ── Resume from checkpoint if requested ──────────────────────────────────
     start_step = 0
@@ -155,7 +161,7 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
 
         # ── Periodic evaluation ───────────────────────────────────────────────
         if step % config.eval_every == 0:
-            test_acc = trainer.evaluate(test_prompts, test_gts, n_eval=20)
+            test_acc = trainer.evaluate(test_prompts, test_gts, n_eval=config.eval_size)
 
             # (ii) Training stability: variance over the last window
             window = reward_window[-config.eval_every:] if len(reward_window) >= config.eval_every \
@@ -230,7 +236,7 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
     logger.save()
 
     # ── Final evaluation ──────────────────────────────────────────────────────
-    final_acc = trainer.evaluate(test_prompts, test_gts, n_eval=50)
+    final_acc = trainer.evaluate(test_prompts, test_gts, n_eval=config.final_eval_size)
     print(f"\n[E2.7] Final test accuracy (PPO, {config.critic_capacity} critic): {final_acc:.3f}")
     print(f"[E2.7] Log saved to {config.output_dir}/{config.experiment_name}.json")
 

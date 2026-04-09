@@ -210,9 +210,20 @@ class TestExtractAnswerFromCompletion:
         """Natural language 'the answer is N' format."""
         assert extract_answer_from_completion("So the answer is 99") == "99"
 
-    def test_fallback_last_number(self):
-        """Falls back to the last number when no pattern matches."""
-        assert extract_answer_from_completion("step 1: 10, step 2: 20") == "20"
+    def test_no_explicit_answer_returns_none(self):
+        """Strict extraction (L13): if the model never commits to an answer
+        via ####, \\boxed{}, or 'the answer is X', extraction must return None.
+        Previously this returned the last number ('20'), which gave spurious
+        reward to outputs that contained the right number by accident.
+        """
+        assert extract_answer_from_completion("step 1: 10, step 2: 20") is None
+
+    def test_intermediate_calculation_not_extracted(self):
+        """L13: 'last number' fallback removed -- intermediate arithmetic
+        no longer matches as a final answer."""
+        assert extract_answer_from_completion(
+            "First I compute 6*7=42, then 42-2=40."
+        ) is None
 
     def test_no_numbers_returns_none(self):
         """Returns None when the completion has no numbers at all."""
