@@ -59,9 +59,18 @@ def format_prompt_with_template(question: str, tokenizer=None, system_prompt: st
     Falls back to plain text format if tokenizer is None or has no chat template.
     """
     if system_prompt is None:
+        # We ask for \boxed{} (LaTeX) rather than #### because measured on
+        # untrained Qwen2.5-0.5B-Instruct (2026-04-08, 20 GSM8K test prompts):
+        #   - "Put your answer after ####": 0/20 emitted ####, 3/20 emitted
+        #     \boxed{} unprompted, parse rate 15%, reward 15%.
+        #   - "Put your answer in \boxed{}":  0/20 emitted ####, 9/20 emitted
+        #     \boxed{}, parse rate 45%, reward 25%.
+        # The model has a strong prior toward LaTeX from its math fine-tuning
+        # data. Our reward parser accepts both formats, so requesting the
+        # format the model already wants to produce is a pure win.
         system_prompt = (
             "Solve this math problem step by step. "
-            "Put your final numerical answer after ####."
+            "Put your final numerical answer in \\boxed{}."
         )
 
     if tokenizer is not None and hasattr(tokenizer, 'apply_chat_template'):
