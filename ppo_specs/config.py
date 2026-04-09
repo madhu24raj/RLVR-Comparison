@@ -41,7 +41,15 @@ class PPOConfig:
                                      # identically 1.0 on the first pass so the printed
                                      # policy_loss is ~0 (gradient is still real;
                                      # see policy_grad_norm metric).
-    kl_coeff: float = 0.0           # optional KL penalty weight (off by default)
+    kl_coeff: float = 0.0           # weight on per-step KL(pi_old || pi_new),
+                                     # the within-batch trust-region penalty
+    reference_kl_coeff: float = 0.0  # weight on KL(pi_new || pi_ref) where pi_ref
+                                     # is a frozen copy of the model from before
+                                     # training started. Anchors the policy against
+                                     # drift away from the initial distribution.
+                                     # Default 0 = off (loads no extra model).
+                                     # Standard RLHF uses ~0.01-0.1. Setting > 0
+                                     # roughly doubles VRAM (loads a second model).
     critic_loss_coeff: float = 0.5  # weight on critic MSE loss in total_loss
     grad_clip_norm: float = 1.0     # max gradient norm for policy and critic
     log_ratio_clip: float = 20.0    # clamp log-ratio before exp() to prevent overflow

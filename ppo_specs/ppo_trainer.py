@@ -106,6 +106,7 @@ class PPOTrainer:
         critic: nn.Module,
         reward_fn: Callable[[str, str], float],
         device: torch.device,
+        reference_model: Optional[AutoModelForCausalLM] = None,
     ):
         self.config = config
         self.model = model
@@ -113,6 +114,26 @@ class PPOTrainer:
         self.critic = critic
         self.reward_fn = reward_fn
         self.device = device
+
+        # Reference model for KL anchoring (L14). When provided, the
+        # PPO loss includes a `config.reference_kl_coeff * KL(pi_new || pi_ref)`
+        # term that penalises the policy for drifting away from this
+        # frozen snapshot. We force eval mode + no_grad on every parameter
+        # so no gradient can flow back into it under any code path.
+        self.reference_model = reference_model
+        if reference_model is not None:
+            reference_model.eval()
+            for p in reference_model.parameters():
+                p.requires_grad_(False)
+
+        # Sanity: if reference_kl_coeff > 0, the user MUST pass a ref model.
+        if config.reference_kl_coeff > 0 and reference_model is None:
+            raise ValueError(
+                f"reference_kl_coeff={config.reference_kl_coeff} > 0 requires "
+                f"reference_model to be passed to PPOTrainer.__init__. "
+                f"Use load_ppo_trainer() which handles this automatically, "
+                f"or pass reference_model explicitly."
+            )
 
         self.policy_optimizer = torch.optim.AdamW(
             model.parameters(), lr=config.learning_rate
@@ -207,6 +228,7 @@ class PPOTrainer:
         self,
         all_full_ids: List[List[int]],
         prompt_lens: List[int],
+        model_override: Optional[AutoModelForCausalLM] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-token response log-probs for a batch.
 
@@ -214,6 +236,15 @@ class PPOTrainer:
         probability of each *response* token under the current policy,
         right-padded across the batch, plus a 1/0 mask marking which
         positions correspond to real tokens.
+
+        Args:
+            all_full_ids:    list of [prompt | response] token id lists
+            prompt_lens:     prompt lengths (so we can slice off the response)
+            model_override:  if provided, run the forward pass through this
+                             model instead of self.model. Used by the
+                             reference-KL code path to compute log probs
+                             under the frozen reference policy without
+                             duplicating this method.
 
         Returns:
             log_probs: [B, T_max_response]   per-token log probs (response only)
@@ -223,6 +254,8 @@ class PPOTrainer:
         token-level ratios. The legacy _batched_sequence_log_probs() sums
         across T to recover the older sequence-level scalars.
         """
+        model = model_override if model_override is not None else self.model
+
         B = len(all_full_ids)
         # Pad full token ids to the longest sequence in the batch
         max_len = max(len(ids) for ids in all_full_ids)
@@ -237,7 +270,7 @@ class PPOTrainer:
             padded[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
             attention_mask[i, :len(ids)] = 1
 
-        outputs = self.model(
+        outputs = model(
             input_ids=padded, attention_mask=attention_mask, use_cache=False,
         )
         logits = outputs.logits.float()  # log_softmax in fp32 for stability
@@ -345,6 +378,7 @@ class PPOTrainer:
         precomputed_advantages: Optional[torch.Tensor] = None,
         precomputed_old_per_token_log_probs: Optional[torch.Tensor] = None,
         precomputed_response_mask: Optional[torch.Tensor] = None,
+        precomputed_ref_per_token_log_probs: Optional[torch.Tensor] = None,
     ) -> Dict[str, float]:
         """One PPO gradient step on the collected batch (per-token loss).
 
@@ -438,10 +472,27 @@ class PPOTrainer:
         kl_per_token = (old_per_token - new_per_token) * mask  # [B, T]
         kl = kl_per_token.sum() / mask_sum
 
+        # ── Reference KL anchor (L14) ────────────────────────────────────────
+        # KL(pi_new || pi_ref) where pi_ref is a frozen snapshot of the
+        # initial policy. This penalises the policy for drifting away from
+        # its starting distribution -- the standard RLHF "anchor" term.
+        # Estimator: mean(new_log_prob - ref_log_prob) per token, masked.
+        # We use this direction (KL(new||ref)) rather than KL(ref||new)
+        # because our token sequences are sampled from the current policy,
+        # making the KL(new||ref) Monte Carlo estimator unbiased
+        # (TRL/InstructGPT convention).
+        kl_ref = torch.tensor(0.0, device=self.device)
+        if (precomputed_ref_per_token_log_probs is not None
+                and self.config.reference_kl_coeff > 0):
+            ref_per_token = precomputed_ref_per_token_log_probs.detach()
+            kl_ref_per_token = (new_per_token - ref_per_token) * mask  # [B, T]
+            kl_ref = kl_ref_per_token.sum() / mask_sum
+
         # ── Combined loss and backward ────────────────────────────────────────
         total_loss = (policy_loss
                       + self.config.critic_loss_coeff * critic_loss
-                      + self.config.kl_coeff * kl)
+                      + self.config.kl_coeff * kl
+                      + self.config.reference_kl_coeff * kl_ref)
 
         self.policy_optimizer.zero_grad()
         if self.critic_optimizer:
@@ -474,6 +525,7 @@ class PPOTrainer:
             "policy_grad_norm": float(policy_grad_norm),
             "critic_loss": critic_loss.item(),
             "kl_divergence": kl.item(),
+            "kl_ref_divergence": kl_ref.item(),
             "mean_reward": rewards.mean().item(),
             "reward_variance": rewards.var().item(),
             "mean_advantage": advantages.mean().item(),
@@ -561,6 +613,20 @@ class PPOTrainer:
         fixed_old_per_token = fixed_old_per_token.detach()
         fixed_response_mask = fixed_response_mask.detach()
 
+        # ── Freeze per-token reference log probs once (L14 anchor) ──────────
+        # Only computed when reference KL is enabled. The reference model
+        # is frozen for the entire run, so its log probs depend only on the
+        # rollout token ids -- not on the K-epoch loop iteration.
+        fixed_ref_per_token: Optional[torch.Tensor] = None
+        if self.reference_model is not None and self.config.reference_kl_coeff > 0:
+            with torch.no_grad():
+                ref_per_token, _ = self._batched_per_token_log_probs(
+                    [r.full_ids for r in batch.rollouts],
+                    [r.prompt_len for r in batch.rollouts],
+                    model_override=self.reference_model,
+                )
+            fixed_ref_per_token = ref_per_token.detach()
+
         all_metrics: List[Dict[str, float]] = []
         for epoch in range(self.config.n_ppo_epochs):
             metrics = self.ppo_update(
@@ -568,6 +634,7 @@ class PPOTrainer:
                 precomputed_advantages=fixed_advantages,
                 precomputed_old_per_token_log_probs=fixed_old_per_token,
                 precomputed_response_mask=fixed_response_mask,
+                precomputed_ref_per_token_log_probs=fixed_ref_per_token,
             )
             all_metrics.append(metrics)
 
@@ -673,6 +740,23 @@ def load_ppo_trainer(config: PPOConfig, device: torch.device) -> PPOTrainer:
     critic = build_critic(config.critic_capacity, hidden_size)
     critic = critic.to(device)  # stays float32
 
+    # Load reference model for KL anchoring (L14) when enabled.
+    # NOTE: this loads a SECOND copy of the model -- roughly doubling
+    # parameter memory. On a single GPU with an 8B model in bf16 this
+    # is ~16 GB extra. We do not enable gradient checkpointing on the
+    # reference model because it never sees gradients.
+    reference_model = None
+    if config.reference_kl_coeff > 0:
+        print(f"[PPO] reference_kl_coeff={config.reference_kl_coeff} > 0; "
+              f"loading frozen reference model (doubles weight memory)")
+        reference_model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            dtype=torch_dtype,
+        ).to(device)
+        reference_model.eval()
+        for p in reference_model.parameters():
+            p.requires_grad_(False)
+
     return PPOTrainer(
         config=config,
         model=model,
@@ -680,4 +764,5 @@ def load_ppo_trainer(config: PPOConfig, device: torch.device) -> PPOTrainer:
         critic=critic,
         reward_fn=gsm8k_reward,
         device=device,
+        reference_model=reference_model,
     )

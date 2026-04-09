@@ -82,6 +82,22 @@ def reference_per_token_ppo_loss(
     return (per_token_pg * mask).sum() / mask_sum
 
 
+def reference_kl_anchor(
+    new_log_probs: torch.Tensor,   # [B, T]
+    ref_log_probs: torch.Tensor,   # [B, T] -- frozen, from reference model
+    mask: torch.Tensor,            # [B, T] -- 1 = real token, 0 = padding
+) -> torch.Tensor:
+    """The L14 reference-KL anchor: KL(pi_new || pi_ref), masked.
+
+    Estimator: mean(new_log_prob - ref_log_prob) per unmasked token.
+    Direction matches TRL/InstructGPT (not the textbook KL definition);
+    this direction is unbiased when sequences are sampled from pi_new.
+    """
+    kl_per_token = (new_log_probs - ref_log_probs) * mask  # [B, T]
+    mask_sum = mask.sum().clamp(min=1.0)
+    return kl_per_token.sum() / mask_sum
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 1. At ratio = 1, loss collapses to -masked_mean(broadcast(A))
 # ─────────────────────────────────────────────────────────────────────────────
@@ -356,6 +372,102 @@ class TestAllMaskedDegenerate:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 6. Reference-KL anchor (L14) -- formula tests
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class TestReferenceKLAnchor:
+    """The reference-KL anchor penalises drift from a frozen reference policy.
+
+    Estimator: mean(new_log_prob - ref_log_prob) per unmasked token.
+    Sign convention: positive when the new policy puts MORE probability
+    on the observed tokens than the reference policy.
+    """
+
+    def test_kl_is_zero_when_new_equals_ref(self):
+        """At the very first step of training, pi_new == pi_ref, so kl_ref = 0."""
+        B, T = 3, 4
+        lp = torch.tensor([
+            [-0.5, -0.7, -1.0, -1.2],
+            [-0.3, -0.4, -0.5, -0.6],
+            [-0.8, -0.9, -1.1, -1.3],
+        ])
+        mask = torch.ones(B, T)
+        kl = reference_kl_anchor(lp, lp, mask)
+        assert kl.item() == pytest.approx(0.0, abs=1e-7)
+
+    def test_kl_positive_when_new_more_confident_than_ref(self):
+        """If new_log_prob > ref_log_prob (new policy assigns higher
+        probability), kl_ref > 0."""
+        B, T = 1, 3
+        new_lp = torch.tensor([[-0.5, -0.5, -0.5]])
+        ref_lp = torch.tensor([[-1.0, -1.0, -1.0]])  # ref is more uncertain
+        mask = torch.ones(B, T)
+        kl = reference_kl_anchor(new_lp, ref_lp, mask)
+        # new - ref = 0.5 per token; mean = 0.5
+        assert kl.item() == pytest.approx(0.5, abs=1e-6)
+
+    def test_kl_negative_when_new_less_confident_than_ref(self):
+        """If new puts LESS probability on the observed tokens than ref,
+        kl_ref is negative. (Note: this means the textbook KL inequality
+        does not hold for this Monte Carlo estimator -- it can go either
+        way pointwise. Standard for the TRL convention.)"""
+        B, T = 1, 3
+        new_lp = torch.tensor([[-1.5, -1.5, -1.5]])
+        ref_lp = torch.tensor([[-1.0, -1.0, -1.0]])
+        mask = torch.ones(B, T)
+        kl = reference_kl_anchor(new_lp, ref_lp, mask)
+        assert kl.item() == pytest.approx(-0.5, abs=1e-6)
+
+    def test_kl_respects_mask(self):
+        """Padding positions should not affect kl_ref."""
+        B, T = 2, 4
+        new_lp = torch.tensor([
+            [-0.5, -0.5, -0.5, 999.0],   # last token is padding
+            [-0.5, -0.5, 999.0, 999.0],  # last two are padding
+        ])
+        ref_lp = torch.tensor([
+            [-1.0, -1.0, -1.0, -999.0],
+            [-1.0, -1.0, -999.0, -999.0],
+        ])
+        mask = torch.tensor([
+            [1, 1, 1, 0],
+            [1, 1, 0, 0],
+        ], dtype=torch.float32)
+        kl = reference_kl_anchor(new_lp, ref_lp, mask)
+        # Only 5 unmasked tokens. new - ref = 0.5 at every unmasked
+        # position. Mean = 0.5.
+        assert kl.item() == pytest.approx(0.5, abs=1e-6)
+
+    def test_kl_all_masked_is_zero(self):
+        """All-masked case must return 0 (not NaN)."""
+        B, T = 2, 3
+        new_lp = torch.full((B, T), -0.5)
+        ref_lp = torch.full((B, T), -1.0)
+        mask = torch.zeros(B, T)
+        kl = reference_kl_anchor(new_lp, ref_lp, mask)
+        assert torch.isfinite(kl).item()
+        assert kl.item() == 0.0
+
+    def test_kl_gradient_pulls_new_toward_ref_when_above(self):
+        """When new_log_prob > ref_log_prob (kl > 0), the gradient on
+        new_log_prob should be POSITIVE (so a min-loss step DECREASES
+        new_log_prob, pulling it toward ref). This is the anchoring
+        behaviour the term is supposed to provide."""
+        new_lp = torch.tensor([[-0.5]], requires_grad=True)
+        ref_lp = torch.tensor([[-1.0]])
+        mask = torch.ones(1, 1)
+        kl = reference_kl_anchor(new_lp, ref_lp, mask)
+        kl.backward()
+        # d/d(new_lp) of (new_lp - ref_lp) is +1 → gradient is positive,
+        # so SGD on new_lp would decrease it, pulling it toward ref_lp.
+        assert new_lp.grad.item() > 0, (
+            f"Expected ∂kl/∂new_lp > 0 (anchoring direction), "
+            f"got {new_lp.grad.item()}"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 6. Integration: production ppo_update agrees with the reference formula
 # ─────────────────────────────────────────────────────────────────────────────
 #
@@ -462,3 +574,174 @@ class TestProductionPpoUpdateMatchesReference:
             f"reference loss {ref_loss.item():.6e} != "
             f"production loss {prod_loss:.6e}"
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Reference KL anchor (L14) -- integration tests with the real model
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.slow
+class TestReferenceKLIntegration:
+    """End-to-end checks for the reference-KL code path in PPOTrainer.
+
+    Verifies the L14 anchor:
+      - Loads with reference_kl_coeff=0 → no ref model needed, baseline path
+      - Loads with reference_kl_coeff>0 → ref model loaded, kl_ref computed
+      - At step 0 with new == ref, kl_ref should be ~0
+      - Reference model parameters never receive gradients
+    """
+
+    def _make_trainer_with_ref(self, reference_kl_coeff: float):
+        """Build a PPOTrainer with an explicit reference model that is a
+        deep copy of the policy model. We don't go through load_ppo_trainer
+        because that re-loads from HF Hub (slow + flaky)."""
+        import copy
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from ppo_specs.config import PPOConfig
+        from ppo_specs.critic import build_critic
+        from ppo_specs.ppo_trainer import PPOTrainer
+        from src.rewards import gsm8k_reward
+
+        device = torch.device("cpu")
+        MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+        tok = AutoTokenizer.from_pretrained(MODEL)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        tok.padding_side = "left"
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL, dtype=torch.float32,
+        ).to(device)
+        ref_model = copy.deepcopy(model)  # exact snapshot
+
+        cfg = PPOConfig(
+            model_name=MODEL,
+            batch_size=2,
+            n_ppo_epochs=1,
+            critic_capacity="none",
+            max_new_tokens=8,
+            reference_kl_coeff=reference_kl_coeff,
+        )
+        critic = build_critic("none", model.config.hidden_size).to(device)
+        trainer = PPOTrainer(
+            config=cfg, model=model, tokenizer=tok, critic=critic,
+            reward_fn=gsm8k_reward, device=device,
+            reference_model=ref_model,
+        )
+        return trainer
+
+    def _make_dummy_batch(self, trainer):
+        from ppo_specs.ppo_trainer import Rollout, RolloutBatch
+        prompt = "Solve: 2 + 2 ="
+        comp = " The answer is 4."
+        prompt_ids = trainer.tokenizer.encode(prompt, add_special_tokens=True)
+        comp_ids = trainer.tokenizer.encode(comp, add_special_tokens=False)
+        rollouts = [
+            Rollout(prompt=prompt, completion=comp, reward=1.0,
+                    old_log_prob=0.0, value=0.0,
+                    full_ids=prompt_ids + comp_ids, prompt_len=len(prompt_ids)),
+            Rollout(prompt=prompt, completion=comp, reward=0.0,
+                    old_log_prob=0.0, value=0.0,
+                    full_ids=prompt_ids + comp_ids, prompt_len=len(prompt_ids)),
+        ]
+        return RolloutBatch(rollouts)
+
+    def test_ref_kl_zero_at_step_zero(self):
+        """When the policy model has not yet been updated, pi_new == pi_ref,
+        so kl_ref must be ~0 (modulo float-precision noise)."""
+        trainer = self._make_trainer_with_ref(reference_kl_coeff=0.05)
+        metrics = trainer.train_step(
+            ["Solve: 1 + 1 =", "Solve: 2 + 2 ="],
+            ["2", "4"],
+        )
+        # At step 0 the policy weights haven't moved relative to the
+        # reference snapshot, so the per-token log probs should match
+        # exactly and kl_ref should be ~0.
+        assert "kl_ref_divergence" in metrics
+        assert metrics["kl_ref_divergence"] == pytest.approx(0.0, abs=1e-5), (
+            f"Expected kl_ref ~= 0 at step 0, got {metrics['kl_ref_divergence']}"
+        )
+
+    def test_ref_kl_field_present_when_disabled(self):
+        """Even when reference_kl_coeff=0 (and no ref model is used), the
+        metrics dict should still contain kl_ref_divergence so downstream
+        loggers don't break on missing keys. Value should be 0."""
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from ppo_specs.config import PPOConfig
+        from ppo_specs.critic import build_critic
+        from ppo_specs.ppo_trainer import PPOTrainer
+        from src.rewards import gsm8k_reward
+
+        device = torch.device("cpu")
+        MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+        tok = AutoTokenizer.from_pretrained(MODEL)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        tok.padding_side = "left"
+        model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).to(device)
+        cfg = PPOConfig(
+            model_name=MODEL, batch_size=2, n_ppo_epochs=1,
+            critic_capacity="none", max_new_tokens=8,
+            reference_kl_coeff=0.0,  # disabled
+        )
+        critic = build_critic("none", model.config.hidden_size).to(device)
+        trainer = PPOTrainer(
+            config=cfg, model=model, tokenizer=tok, critic=critic,
+            reward_fn=gsm8k_reward, device=device,
+            reference_model=None,  # explicitly no ref model
+        )
+        metrics = trainer.train_step(
+            ["Solve: 1 + 1 =", "Solve: 2 + 2 ="],
+            ["2", "4"],
+        )
+        assert "kl_ref_divergence" in metrics
+        assert metrics["kl_ref_divergence"] == 0.0
+
+    def test_ref_model_grads_never_computed(self):
+        """After a backward pass through the loss, the reference model
+        parameters must not have gradients. This guarantees no information
+        ever flows back into the frozen ref model."""
+        trainer = self._make_trainer_with_ref(reference_kl_coeff=0.05)
+        trainer.train_step(
+            ["Solve: 1 + 1 =", "Solve: 2 + 2 ="],
+            ["2", "4"],
+        )
+        for name, p in trainer.reference_model.named_parameters():
+            assert p.grad is None, (
+                f"reference model param {name} has a non-None grad: "
+                f"{p.grad if p.grad is None else p.grad.abs().max()}"
+            )
+            assert not p.requires_grad, (
+                f"reference model param {name} has requires_grad=True"
+            )
+
+    def test_disabled_path_raises_when_ref_required_but_missing(self):
+        """If reference_kl_coeff > 0 but no reference_model is passed,
+        PPOTrainer.__init__ must raise immediately (don't crash later
+        in train_step)."""
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from ppo_specs.config import PPOConfig
+        from ppo_specs.critic import build_critic
+        from ppo_specs.ppo_trainer import PPOTrainer
+        from src.rewards import gsm8k_reward
+
+        device = torch.device("cpu")
+        MODEL = "Qwen/Qwen2.5-0.5B-Instruct"
+        tok = AutoTokenizer.from_pretrained(MODEL)
+        if tok.pad_token is None:
+            tok.pad_token = tok.eos_token
+        tok.padding_side = "left"
+        model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.float32).to(device)
+        cfg = PPOConfig(
+            model_name=MODEL, batch_size=2, n_ppo_epochs=1,
+            critic_capacity="none", max_new_tokens=8,
+            reference_kl_coeff=0.05,  # enabled
+        )
+        critic = build_critic("none", model.config.hidden_size).to(device)
+
+        with pytest.raises(ValueError, match="reference_kl_coeff"):
+            PPOTrainer(
+                config=cfg, model=model, tokenizer=tok, critic=critic,
+                reward_fn=gsm8k_reward, device=device,
+                reference_model=None,  # missing!
+            )
