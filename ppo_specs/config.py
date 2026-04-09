@@ -149,6 +149,13 @@ def e2_7_config(seed: int = 42) -> PPOConfig:
         final_eval_size=500,      # full reported number
         eval_every=20,
         log_every=5,
+        # Reference KL anchor (L14). 0.01 follows DeepSeekMath's RLVR
+        # default lowered slightly for our smaller model scale. Anchors
+        # the policy against drift away from the initial distribution
+        # over 200 steps; without it we observed clip_fraction climb to
+        # ~0.5 and per-token KL to ~1.0 by step 24 of a local run.
+        # Doubles model VRAM (loads a frozen reference copy).
+        reference_kl_coeff=0.01,
         seed=seed,
         experiment_name=f"ppo_e2_7_seed{seed}",
     )
@@ -168,6 +175,7 @@ def e2_8_config(critic_capacity: str = "medium", seed: int = 42) -> PPOConfig:
         final_eval_size=500,
         eval_every=20,
         log_every=10,
+        reference_kl_coeff=0.01,  # see e2_7_config for justification
         seed=seed,
         experiment_name=f"ppo_e2_8_{critic_capacity}_seed{seed}",
     )
