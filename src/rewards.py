@@ -11,28 +11,36 @@ import re
 def extract_answer_from_completion(completion: str) -> str:
     """Extract the final numerical answer from a model completion.
 
-    Handles multiple formats:
-      - "#### 42"         (GSM8K standard format)
-      - "The answer is 42" (common model output)
-      - "\\boxed{42}"      (LaTeX format from math models)
-      - Last number in text (fallback)
+    Strict extraction: only formats where the model has explicitly
+    committed to an answer count.
 
-    Returns None if no number is found.
+      - "#### 42"           (GSM8K standard format -- the format we
+                             instruct the model to use in the system prompt)
+      - "\\boxed{42}"       (LaTeX format)
+      - "The answer is 42"  (anchored natural language)
+
+    Returns None if no answer is found in any of these formats.
+
+    NOTE: We deliberately do NOT fall back to "last number in completion".
+    That fallback gives reward to outputs that contain the right number
+    by accident (intermediate calculations, problem restatement, etc.)
+    and undermines the verifiability that justifies RLVR. Spurious reward
+    is worse than no reward: it teaches the model to emit numbers without
+    structuring its output. See ppo_specs/specs/logic.md L13.
     """
-    # Try #### format first (most reliable).
-    # Use findall + take last match: consistent with data.py extract_answer
-    # which uses split("####")[-1]. If the model outputs multiple ####
-    # markers (e.g. in reasoning), we want the final one.
+    # 1) #### format. Take the LAST match -- if the model emits multiple
+    #    #### markers (e.g. inside its reasoning), we want the final one,
+    #    consistent with data.py:extract_answer which uses split("####")[-1].
     hash_matches = re.findall(r"####\s*(-?[\d,]+\.?\d*)", completion)
     if hash_matches:
         return hash_matches[-1].replace(",", "")
 
-    # Try \boxed{} format
+    # 2) \boxed{} format
     match = re.search(r"\\boxed\{([^}]+)\}", completion)
     if match:
         return match.group(1).strip()
 
-    # Try "the answer is X" format
+    # 3) "(the )answer is X" -- anchored on natural language, low FP rate.
     match = re.search(
         r"(?:the\s+)?answer\s+is\s*:?\s*(-?[\d,]+\.?\d*)",
         completion,
@@ -40,11 +48,6 @@ def extract_answer_from_completion(completion: str) -> str:
     )
     if match:
         return match.group(1).replace(",", "")
-
-    # Fallback: last number in the completion
-    numbers = re.findall(r"-?[\d,]+\.?\d*", completion)
-    if numbers:
-        return numbers[-1].replace(",", "")
 
     return None
 
@@ -118,6 +121,10 @@ if __name__ == "__main__":
         ("Some random text with no answer", "10"),
         ("#### 100", "200"),  # Wrong answer
         ("Step 1: 5*3=15\nStep 2: 15+10=25\n#### 25", "25"),
+        # L13: strict extraction -- these should now return None / reward 0,
+        # because the model never explicitly committed to an answer.
+        ("Bob has 5 apples and 3 oranges, so 8 fruits total.", "8"),
+        ("First I compute 6*7=42, then 42-2=40.", "40"),
     ]
 
     print("Reward function tests:")

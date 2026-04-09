@@ -48,7 +48,7 @@ import torch
 import numpy as np
 from transformers import set_seed as transformers_set_seed
 
-from src.data import load_gsm8k, format_prompt
+from src.data import load_gsm8k, format_prompt_with_template
 from eval.metrics import ExperimentLogger
 from ppo_specs.config import PPOConfig, local_test_config, e2_8_config, copy_config
 from ppo_specs.ppo_trainer import load_ppo_trainer
@@ -103,7 +103,7 @@ def run_one_capacity(
         metrics = trainer.train_step(batch_p, batch_gt)
 
         if step % cfg.eval_every == 0:
-            test_acc = trainer.evaluate(test_prompts, test_gts, n_eval=20)
+            test_acc = trainer.evaluate(test_prompts, test_gts, n_eval=cfg.eval_size)
             accuracy_curve.append((metrics["total_rollouts"], test_acc))
 
             # (ii) εV: compare critic baseline vs MC ground truth
@@ -153,7 +153,7 @@ def run_one_capacity(
 
     logger.save()
 
-    final_acc  = trainer.evaluate(test_prompts, test_gts, n_eval=50)
+    final_acc  = trainer.evaluate(test_prompts, test_gts, n_eval=cfg.final_eval_size)
     mean_ev    = float(np.nanmean(ev_samples))   if ev_samples   else float("nan")
     mean_bias  = float(np.nanmean(bias_samples)) if bias_samples else float("nan")
 
@@ -184,22 +184,28 @@ def run_e2_8(config: PPOConfig, capacities: list[str]) -> None:
     # ── Shared data ───────────────────────────────────────────────────────────
     print("[E2.8] Loading GSM8K …")
     train_ds = load_gsm8k("train", n_samples=config.n_train_samples, seed=config.seed)
-    test_ds  = load_gsm8k("test",  n_samples=200)
+    test_ds  = load_gsm8k("test",  n_samples=config.n_test_samples)
 
-    train_prompts = [format_prompt(ex["question"]) for ex in train_ds]
     train_gts     = [ex["ground_truth"] for ex in train_ds]
-    test_prompts  = [format_prompt(ex["question"]) for ex in test_ds]
     test_gts      = [ex["ground_truth"] for ex in test_ds]
+
+    # Load a temporary trainer first so we can use its tokenizer's chat template
+    # for prompt formatting (L12). Reused below for MC baseline estimation.
+    tmp_cfg     = copy_config(config, critic_capacity="none")
+    tmp_trainer = load_ppo_trainer(tmp_cfg, device)
+
+    train_prompts = [
+        format_prompt_with_template(ex["question"], tmp_trainer.tokenizer) for ex in train_ds
+    ]
+    test_prompts  = [
+        format_prompt_with_template(ex["question"], tmp_trainer.tokenizer) for ex in test_ds
+    ]
 
     # ── MC baselines (shared reference, estimated once) ───────────────────────
     n_mc = 10 if config.n_steps <= 10 else 50
     ref_p  = train_prompts[:5]
     ref_gt = train_gts[:5]
     print(f"[E2.8] Estimating MC baselines ({n_mc} samples × {len(ref_p)} prompts) …")
-
-    # Load a temporary trainer just for MC estimation
-    tmp_cfg     = copy_config(config, critic_capacity="none")
-    tmp_trainer = load_ppo_trainer(tmp_cfg, device)
     mc_baselines = estimate_mc_advantages(
         tmp_trainer.model, tmp_trainer.tokenizer,
         ref_p, ref_gt, tmp_trainer.reward_fn,

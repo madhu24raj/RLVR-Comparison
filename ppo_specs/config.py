@@ -44,8 +44,20 @@ class PPOConfig:
     eval_every: int = 10
     log_every: int = 5
 
+    # Number of test prompts used for in-loop evaluation during training.
+    # n=20 (the previous hardcoded value) gives stderr ~0.11 at p=0.5,
+    # which dominates the convergence-curve signal. n=100 -> stderr ~0.05.
+    # See specs/logic.md L15.
+    eval_size: int = 100
+    # Number of test prompts used for the single final evaluation. Should
+    # be as large as the test set (or budget) allows, since this is what
+    # gets reported.
+    final_eval_size: int = 200
+
     # ── Data ─────────────────────────────────────────────────────────────────
     n_train_samples: int = 200
+    # Number of test prompts to load. Must be >= max(eval_size, final_eval_size).
+    n_test_samples: int = 500
     seed: int = 42
 
     # ── Bookkeeping ──────────────────────────────────────────────────────────
@@ -82,8 +94,12 @@ def local_test_config() -> PPOConfig:
         batch_size=4,
         max_new_tokens=64,
         n_train_samples=20,
+        n_test_samples=50,        # smoke test only needs a tiny test pool
+        eval_size=10,             # tiny: pipeline check, not signal
+        final_eval_size=20,
         eval_every=2,
         log_every=1,
+        checkpoint_every=0,       # no checkpointing for smoke tests
         experiment_name="ppo_local_test",
     )
 
@@ -94,8 +110,11 @@ def e2_7_config(seed: int = 42) -> PPOConfig:
         model_name="Qwen/Qwen2.5-0.5B-Instruct",
         n_steps=200,
         batch_size=16,
-        max_new_tokens=256,
+        max_new_tokens=384,       # bumped from 256: GSM8K CoT often needs > 256 tokens
         n_train_samples=500,
+        n_test_samples=500,
+        eval_size=100,            # stderr ~0.05 at p=0.5
+        final_eval_size=500,      # full reported number
         eval_every=20,
         log_every=5,
         seed=seed,
@@ -110,8 +129,11 @@ def e2_8_config(critic_capacity: str = "medium", seed: int = 42) -> PPOConfig:
         critic_capacity=critic_capacity,
         n_steps=150,
         batch_size=16,
-        max_new_tokens=256,
+        max_new_tokens=384,       # bumped from 256: GSM8K CoT often needs > 256 tokens
         n_train_samples=500,
+        n_test_samples=500,
+        eval_size=100,
+        final_eval_size=500,
         eval_every=20,
         log_every=10,
         seed=seed,
