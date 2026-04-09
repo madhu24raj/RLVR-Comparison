@@ -189,16 +189,14 @@ return (
 
 ## R10 — `ALL_CAPACITIES` defined in wrong file
 
-**Status**: Partially Fixed (2026-04-08)
+**Status**: **Fixed** (2026-04-09)
 
-**Location:** `ppo_specs/config.py` (line 72), `ppo_specs/run_e2_8.py` (line 62)
+**Location:** `ppo_specs/config.py` (line 72), `ppo_specs/run_e2_8.py`
 
 **Problem:** The list of valid critic capacities was buried inside `run_e2_8.py`.
 
-**Current state:** `CRITIC_CAPACITIES: list[str] = ["none", "small", "medium", "large"]`
-is now defined in `config.py`. However, `run_e2_8.py` still defines a local
-`ALL_CAPACITIES` instead of importing from `config.py`. The import should be added
-and the local definition removed.
+**Resolution:** `run_e2_8.py` now imports `CRITIC_CAPACITIES` from `config.py`
+instead of defining a local `ALL_CAPACITIES`. All references updated.
 
 ---
 

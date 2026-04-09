@@ -267,7 +267,7 @@ class TestBatchedVsSingleLogProb:
             ).cpu().float()
 
         torch.testing.assert_close(
-            batched_tensor, single_tensor, atol=1e-4, rtol=1e-4,
+            batched_tensor, individual_tensor, atol=1e-4, rtol=1e-4,
         )
 
 
@@ -438,7 +438,7 @@ class TestBatchedCriticValues:
         individual_tensor = torch.tensor(individual_vals, dtype=torch.float32)
 
         torch.testing.assert_close(
-            batched_vals.float(), single_tensor, atol=1e-4, rtol=1e-4,
+            batched_vals.float(), individual_tensor, atol=1e-4, rtol=1e-4,
         )
 
     @pytest.mark.slow

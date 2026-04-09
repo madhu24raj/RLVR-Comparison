@@ -44,6 +44,8 @@ ppo_specs/
     ├── safety.md
     ├── logic.md
     ├── performance.md
+    ├── scaling_analysis.md       ← NEW: critical scaling/training logic analysis
+    ├── code_review_2026_04_09.md ← NEW: comprehensive 3-agent review findings
     ├── batched_generation.md
     ├── memory_optimization.md
     ├── checkpointing.md
@@ -125,7 +127,9 @@ ppo_specs/tests/
 ├── test_batched_ops.py      ← Batched generation correctness tests
 ├── test_checkpoint.py       ← Checkpoint save/load/resume tests
 ├── test_cluster_features.py ← Dtype, gradient checkpointing tests
-└── test_e2e_pipeline.py     ← End-to-end integration tests
+├── test_e2e_pipeline.py     ← End-to-end integration tests
+├── test_training_logic.py   ← NEW: Training correctness, gradient isolation, PPO math
+└── test_scaling.py          ← NEW: Scaling invariants, memory safety, critic scaling
 ```
 
 Run all tests:
@@ -545,6 +549,29 @@ cfg.gradient_checkpointing = True  # required to avoid OOM
 ---
 
 ## Recent Fixes
+
+### 2026-04-09 -- Three-agent code review
+
+Comprehensive review by training logic (DL PhD), readability (senior SWE), and
+performance (ML infrastructure) agents. 12 core algorithm components verified
+correct; 15 code fixes applied; 2 new spec documents and 2 new test files added.
+
+| File | Change | Category |
+|------|--------|----------|
+| `ppo_trainer.py` | Removed dead legacy methods `_sequence_log_prob`, `_critic_value_no_grad` | Readability |
+| `ppo_trainer.py` | Extracted `_extract_last_hidden()` to deduplicate 3-way critic code | Readability |
+| `ppo_trainer.py` | Magic numbers → config: `max_prompt_length`, `grad_clip_norm`, `log_ratio_clip`, `eval_batch_size` | Readability |
+| `config.py` | Added 4 new config fields, class docstring | Config |
+| `run_e2_7.py` | Fixed logger overwrite on resume (data loss bug) | Bug fix |
+| `run_e2_7.py` | Renamed `reward_window` → `reward_history` | Readability |
+| `run_e2_8.py` | Reset RNG seeds before each capacity run | Methodology |
+| `run_e2_8.py` | Fixed GPU memory cleanup (`model.cpu()` + `gc.collect()`) | Safety |
+| `run_e2_8.py` | `ALL_CAPACITIES` → `CRITIC_CAPACITIES` import | Readability |
+| `test_batched_ops.py` | Fixed `single_tensor` → `individual_tensor` NameError (2 sites) | Bug fix |
+| `specs/code_review_2026_04_09.md` | New: full review findings and verified-correct items | Documentation |
+| `specs/scaling_analysis.md` | New: memory estimates, throughput, scaling roadmap | Documentation |
+| `tests/test_training_logic.py` | New: 33 tests for PPO math, gradient isolation, numerics | Tests |
+| `tests/test_scaling.py` | New: 31 tests for scaling invariants, critic sizing, memory | Tests |
 
 ### 2026-04-08 -- Cluster readiness
 

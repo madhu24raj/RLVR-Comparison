@@ -137,8 +137,9 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
         print("[E2.7] MC baselines:", {k[-30:]: f"{v:.3f}" for k, v in mc_baselines.items()})
 
     # ── Training loop ─────────────────────────────────────────────────────────
-    logger = ExperimentLogger(config.experiment_name, config.output_dir)
-    reward_window: list[float] = []  # rolling window for variance (stability)
+    if not resume_path or not resume_path.strip():
+        logger = ExperimentLogger(config.experiment_name, config.output_dir)
+    reward_history: list[float] = []  # accumulated rewards for variance (stability)
 
     # ── Set up graceful exit handler ─────────────────────────────────────
     exit_handler = GracefulExitHandler()
@@ -149,7 +150,7 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
         batch_gt = cycle_batch(train_gts,     step, config.batch_size)
 
         metrics = trainer.train_step(batch_p, batch_gt)
-        reward_window.append(metrics["mean_reward"])
+        reward_history.append(metrics["mean_reward"])
 
         if step % config.log_every == 0:
             print(
@@ -164,8 +165,8 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
             test_acc = trainer.evaluate(test_prompts, test_gts, n_eval=config.eval_size)
 
             # (ii) Training stability: variance over the last window
-            window = reward_window[-config.eval_every:] if len(reward_window) >= config.eval_every \
-                     else reward_window
+            window = reward_history[-config.eval_every:] if len(reward_history) >= config.eval_every \
+                     else reward_history
             stability = float(np.var(window))
 
             # (iv) Advantage estimation error

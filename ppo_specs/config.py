@@ -11,6 +11,21 @@ import dataclasses
 
 @dataclass
 class PPOConfig:
+    """
+    Unified configuration for PPO training on RLVR tasks.
+
+    Field groups
+    ────────────
+    Model          model_name
+    PPO            learning_rate, critic_lr, clip_epsilon, gamma,
+                   n_ppo_epochs, kl_coeff, critic_loss_coeff, grad_clip_norm
+    Rollout        n_rollouts_per_prompt, batch_size, max_new_tokens,
+                   temperature, do_sample, max_prompt_length
+    Critic (E2.8)  critic_capacity  ("none" | "small" | "medium" | "large")
+    Schedule       n_steps, eval_every, log_every, eval_size, final_eval_size
+    Data           n_train_samples, n_test_samples, seed
+    Bookkeeping    experiment_name, output_dir
+    """
     # ── Model ────────────────────────────────────────────────────────────────
     # 0.5 B for local verification; replace with Llama-3-8B on the cluster.
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct"
@@ -23,14 +38,18 @@ class PPOConfig:
     n_ppo_epochs: int = 1           # gradient steps per collected batch
     kl_coeff: float = 0.0           # optional KL penalty weight (off by default)
     critic_loss_coeff: float = 0.5  # weight on critic MSE loss in total_loss
+    grad_clip_norm: float = 1.0     # max gradient norm for policy and critic
+    log_ratio_clip: float = 20.0    # clamp log-ratio before exp() to prevent overflow
 
     # ── Rollout settings ─────────────────────────────────────────────────────
     # E2.7 spec: PPO uses 1 rollout per prompt (plus critic).
     n_rollouts_per_prompt: int = 1
     batch_size: int = 8             # prompts per training step
     max_new_tokens: int = 256
+    max_prompt_length: int = 512    # truncation limit for prompt tokenization
     temperature: float = 0.7
     do_sample: bool = True
+    eval_batch_size: int = 8        # sub-batch size for batched evaluation
 
     # ── Critic architecture (E2.8 sweep) ────────────────────────────────────
     # "none"   → REINFORCE with batch-mean baseline

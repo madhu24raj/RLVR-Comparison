@@ -50,7 +50,7 @@ from transformers import set_seed as transformers_set_seed
 
 from src.data import load_gsm8k, format_prompt_with_template
 from eval.metrics import ExperimentLogger
-from ppo_specs.config import PPOConfig, local_test_config, e2_8_config, copy_config
+from ppo_specs.config import PPOConfig, CRITIC_CAPACITIES, local_test_config, e2_8_config, copy_config
 from ppo_specs.ppo_trainer import load_ppo_trainer
 from ppo_specs.advantage import (
     estimate_mc_advantages,
@@ -58,8 +58,6 @@ from ppo_specs.advantage import (
     critic_approximation_error,
 )
 from ppo_specs.utils import cycle_batch
-
-ALL_CAPACITIES = ["none", "small", "medium", "large"]
 
 
 # ── Single capacity run ───────────────────────────────────────────────────────
@@ -214,7 +212,11 @@ def run_e2_8(config: PPOConfig, capacities: list[str]) -> None:
         temperature=config.temperature,
         device=str(device),
     )
-    del tmp_trainer  # free VRAM before sweep
+    # Free VRAM before sweep: move model to CPU first, then GC
+    import gc
+    tmp_trainer.model.cpu()
+    del tmp_trainer
+    gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
@@ -223,6 +225,14 @@ def run_e2_8(config: PPOConfig, capacities: list[str]) -> None:
     # ── Capacity sweep ────────────────────────────────────────────────────────
     results = []
     for cap in capacities:
+        # Reset RNG state before each capacity for fair comparison
+        random.seed(config.seed)
+        torch.manual_seed(config.seed)
+        np.random.seed(config.seed)
+        transformers_set_seed(config.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(config.seed)
+
         result = run_one_capacity(
             cap, config,
             train_prompts, train_gts,
@@ -273,6 +283,6 @@ if __name__ == "__main__":
         caps = [args.capacity] if args.capacity else ["none", "small"]
     else:
         cfg  = e2_8_config(seed=args.seed)
-        caps = [args.capacity] if args.capacity else ALL_CAPACITIES
+        caps = [args.capacity] if args.capacity else CRITIC_CAPACITIES
 
     run_e2_8(cfg, caps)

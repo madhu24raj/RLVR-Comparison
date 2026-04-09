@@ -153,30 +153,15 @@ pass over all prompts. No per-sample GPU tensor creation occurs.
 
 ## S8 — `del tmp_trainer` does not free GPU VRAM [MEDIUM]
 
-**Location:** `ppo_specs/run_e2_8.py:200–202`
+**Status**: **Fixed** (2026-04-09)
 
-**Problem:**
-```python
-del tmp_trainer
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-```
-`del` in Python decrements the reference count but does not trigger the garbage
-collector synchronously, especially for cyclic references. `empty_cache()` only
-frees CUDA memory that is already unused — it cannot force collection.
+**Location:** `ppo_specs/run_e2_8.py`
 
-**Failure mode:** The 0.5B (or 8B) model remains in GPU memory throughout the sweep,
-causing OOM when loading the first per-capacity model.
+**Problem:** `del tmp_trainer` + `empty_cache()` did not reliably free VRAM.
 
-**Fix:**
-```python
-import gc
-tmp_trainer.model.cpu()       # move weights off GPU first
-del tmp_trainer
-gc.collect()                  # force CPython GC
-if torch.cuda.is_available():
-    torch.cuda.empty_cache()
-```
+**Resolution:** Now moves model to CPU first, calls `gc.collect()`, then
+`torch.cuda.empty_cache()`. This ensures all GPU tensors are freed before
+loading per-capacity models.
 
 ---
 

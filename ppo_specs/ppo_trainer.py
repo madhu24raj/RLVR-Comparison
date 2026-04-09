@@ -41,7 +41,7 @@ if _ROOT not in sys.path:
 import torch
 import torch.nn as nn
 import numpy as np
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -146,7 +146,7 @@ class PPOTrainer:
         # Batch tokenize with left-padding
         enc = self.tokenizer(
             prompts, return_tensors="pt", truncation=True,
-            max_length=512, padding=True,
+            max_length=self.config.max_prompt_length, padding=True,
         ).to(self.device)
         prompt_lens = enc["attention_mask"].sum(dim=1).tolist()  # actual lengths per sample
 
@@ -250,9 +250,22 @@ class PPOTrainer:
         if not self.critic.is_trainable():
             return torch.zeros(len(prompts), device=self.device)
 
+        hidden_at_last = self._extract_last_hidden(prompts)
+        return self.critic(hidden_at_last.float())  # critic stays fp32
+
+    # ── Shared hidden-state extraction ───────────────────────────────────────
+
+    @torch.no_grad()
+    def _extract_last_hidden(self, prompts: List[str]) -> torch.Tensor:
+        """
+        Tokenize prompts, run a no-grad LM forward pass, and return
+        the hidden state at the last real (non-padding) token per sample.
+
+        Returns: [B, H] float tensor (detached).
+        """
         enc = self.tokenizer(
             prompts, return_tensors="pt", truncation=True,
-            max_length=512, padding=True,
+            max_length=self.config.max_prompt_length, padding=True,
         ).to(self.device)
 
         outputs = self.model(
@@ -262,56 +275,10 @@ class PPOTrainer:
             output_hidden_states=True,
         )
 
-        # Get last non-padding token's hidden state per sample
-        seq_lens = enc["attention_mask"].sum(dim=1) - 1  # index of last real token
         last_hidden = outputs.hidden_states[-1]  # [B, S, H]
+        seq_lens = enc["attention_mask"].sum(dim=1) - 1  # index of last real token
         batch_idx = torch.arange(len(prompts), device=self.device)
-        hidden_at_last = last_hidden[batch_idx, seq_lens, :]  # [B, H]
-
-        return self.critic(hidden_at_last.float())  # critic stays fp32
-
-    # ── Legacy single-sample methods (kept for backward compatibility) ───────
-
-    def _sequence_log_prob(
-        self,
-        input_ids: torch.Tensor,  # [1, seq_len]
-        prompt_len: int,
-    ) -> torch.Tensor:
-        """
-        Sum of per-token log probabilities for the response portion only.
-
-        The language model produces logits[t] predicting token t+1, so:
-            log π(a_t | s, a_<t) = log_softmax(logits[prompt_len + t - 1])[a_t]
-        """
-        outputs = self.model(input_ids=input_ids, use_cache=False)
-        logits = outputs.logits.float()  # upcast to fp32 for numerical stability
-        log_probs = torch.log_softmax(logits, dim=-1)  # [1, L, V]
-
-        response_ids = input_ids[:, prompt_len:]           # [1, R]
-        if response_ids.shape[1] == 0:
-            return torch.zeros(1, device=self.device)
-
-        # logits at positions [prompt_len-1 : L-1] predict tokens [prompt_len : L]
-        response_log_probs = log_probs[:, prompt_len - 1 : -1, :]  # [1, R, V]
-        token_lp = response_log_probs.gather(
-            2, response_ids.unsqueeze(-1)
-        ).squeeze(-1)  # [1, R]
-
-        return token_lp.sum(dim=-1)  # [1]
-
-    @torch.no_grad()
-    def _critic_value_no_grad(self, prompt_ids: torch.Tensor) -> float:
-        """Extract last-token hidden state and run critic (no gradient)."""
-        if not self.critic.is_trainable():
-            return 0.0  # replaced by batch mean in compute_advantages
-
-        outputs = self.model(
-            input_ids=prompt_ids,
-            use_cache=False,
-            output_hidden_states=True,
-        )
-        last_hidden = outputs.hidden_states[-1][:, -1, :]  # [1, H]
-        return self.critic(last_hidden.float()).item()
+        return last_hidden[batch_idx, seq_lens, :]  # [B, H]
 
     # ── Critic evaluation on prompts (batched) ───────────────────────────────
 
@@ -324,25 +291,7 @@ class PPOTrainer:
         if not self.critic.is_trainable():
             return np.zeros(len(prompts))
 
-        enc = self.tokenizer(
-            prompts, return_tensors="pt", truncation=True,
-            max_length=512, padding=True,
-        ).to(self.device)
-
-        outputs = self.model(
-            input_ids=enc["input_ids"],
-            attention_mask=enc["attention_mask"],
-            use_cache=False,
-            output_hidden_states=True,
-        )
-
-        # Extract last real token per sample
-        # With left-padding, last real token is always at position -1
-        last_hidden = outputs.hidden_states[-1]  # [B, S, H]
-        seq_lens = enc["attention_mask"].sum(dim=1) - 1
-        batch_idx = torch.arange(len(prompts), device=self.device)
-        hidden_at_last = last_hidden[batch_idx, seq_lens, :]
-
+        hidden_at_last = self._extract_last_hidden(prompts)
         values = self.critic(hidden_at_last.float())
         return values.cpu().numpy()
 
@@ -391,7 +340,7 @@ class PPOTrainer:
         new_log_probs = self._policy_log_probs(batch)
 
         log_ratio = new_log_probs - old_log_probs.detach()
-        log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
+        log_ratio = torch.clamp(log_ratio, -self.config.log_ratio_clip, self.config.log_ratio_clip)
         ratio = torch.exp(log_ratio)
         clipped = torch.clamp(
             ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon
@@ -415,9 +364,9 @@ class PPOTrainer:
 
         total_loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.grad_clip_norm)
         if self.critic.is_trainable():
-            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=self.config.grad_clip_norm)
         self.policy_optimizer.step()
         if self.critic_optimizer:
             self.critic_optimizer.step()
@@ -468,23 +417,7 @@ class PPOTrainer:
         self.critic.train()
         prompts = [r.prompt for r in batch.rollouts]
 
-        enc = self.tokenizer(
-            prompts, return_tensors="pt", truncation=True,
-            max_length=512, padding=True,
-        ).to(self.device)
-
-        with torch.no_grad():
-            outputs = self.model(
-                input_ids=enc["input_ids"],
-                attention_mask=enc["attention_mask"],
-                use_cache=False,
-                output_hidden_states=True,
-            )
-
-        seq_lens = enc["attention_mask"].sum(dim=1) - 1
-        last_hidden = outputs.hidden_states[-1]
-        batch_idx = torch.arange(len(prompts), device=self.device)
-        hidden_at_last = last_hidden[batch_idx, seq_lens, :].detach()
+        hidden_at_last = self._extract_last_hidden(prompts).detach()
 
         critic_values = self.critic(hidden_at_last.float())
         critic_loss = torch.nn.functional.mse_loss(critic_values, rewards)
@@ -547,7 +480,7 @@ class PPOTrainer:
         eval_prompts = prompts[:n_eval]
         eval_gts = ground_truths[:n_eval]
 
-        eval_batch_size = min(8, len(eval_prompts))
+        eval_batch_size = min(self.config.eval_batch_size, len(eval_prompts))
         rewards: List[float] = []
 
         for start in range(0, len(eval_prompts), eval_batch_size):
@@ -556,7 +489,7 @@ class PPOTrainer:
 
             enc = self.tokenizer(
                 batch_p, return_tensors="pt", truncation=True,
-                max_length=512, padding=True,
+                max_length=self.config.max_prompt_length, padding=True,
             ).to(self.device)
 
             out = self.model.generate(
