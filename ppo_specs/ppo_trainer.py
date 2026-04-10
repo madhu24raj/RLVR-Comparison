@@ -52,6 +52,11 @@ from eval.metrics import ExperimentLogger
 from eval.metrics import accuracy as compute_accuracy
 
 from ppo_specs.config import PPOConfig
+from shared.per_token_loss import (
+    batched_per_token_log_probs,
+    clipped_surrogate_loss,
+    per_token_kl,
+)
 from ppo_specs.critic import build_critic
 from ppo_specs.advantage import compute_advantages
 
@@ -232,78 +237,13 @@ class PPOTrainer:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Per-token response log-probs for a batch.
 
-        This is the source of truth for the PPO loss: returns the log
-        probability of each *response* token under the current policy,
-        right-padded across the batch, plus a 1/0 mask marking which
-        positions correspond to real tokens.
-
-        Args:
-            all_full_ids:    list of [prompt | response] token id lists
-            prompt_lens:     prompt lengths (so we can slice off the response)
-            model_override:  if provided, run the forward pass through this
-                             model instead of self.model. Used by the
-                             reference-KL code path to compute log probs
-                             under the frozen reference policy without
-                             duplicating this method.
-
-        Returns:
-            log_probs: [B, T_max_response]   per-token log probs (response only)
-            mask:      [B, T_max_response]   1 where real, 0 where padding
-
-        The PPO surrogate loss in ppo_update() uses these to compute
-        token-level ratios. The legacy _batched_sequence_log_probs() sums
-        across T to recover the older sequence-level scalars.
+        Delegates to shared.per_token_loss.batched_per_token_log_probs.
         """
         model = model_override if model_override is not None else self.model
-
-        B = len(all_full_ids)
-        # Pad full token ids to the longest sequence in the batch
-        max_len = max(len(ids) for ids in all_full_ids)
-        padded = torch.full(
-            (B, max_len), self.tokenizer.pad_token_id,
-            dtype=torch.long, device=self.device,
+        return batched_per_token_log_probs(
+            model, all_full_ids, prompt_lens,
+            self.tokenizer.pad_token_id, self.device,
         )
-        attention_mask = torch.zeros(
-            B, max_len, dtype=torch.long, device=self.device,
-        )
-        for i, ids in enumerate(all_full_ids):
-            padded[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
-            attention_mask[i, :len(ids)] = 1
-
-        outputs = model(
-            input_ids=padded, attention_mask=attention_mask, use_cache=False,
-        )
-        logits = outputs.logits.float()  # log_softmax in fp32 for stability
-        log_probs_full = torch.log_softmax(logits, dim=-1)  # [B, max_len, V]
-
-        # The longest *response* across the batch sets the [B, T] shape.
-        max_resp_len = max(
-            max(len(all_full_ids[i]) - prompt_lens[i], 0) for i in range(B)
-        )
-        if max_resp_len == 0:
-            # Pathological case: no sample has any response tokens.
-            zeros = torch.zeros((B, 1), device=self.device)
-            return zeros, torch.zeros((B, 1), device=self.device)
-
-        per_token = torch.zeros((B, max_resp_len), device=self.device)
-        mask = torch.zeros((B, max_resp_len), device=self.device)
-
-        for i in range(B):
-            pl = prompt_lens[i]
-            seq_len = len(all_full_ids[i])
-            resp_len = seq_len - pl
-            if resp_len <= 0:
-                continue
-            # logits at positions [pl-1 : seq_len-1] predict tokens [pl : seq_len]
-            response_log_probs = log_probs_full[i, pl - 1 : seq_len - 1, :]  # [R, V]
-            response_ids = padded[i, pl:seq_len]  # [R]
-            token_lp = response_log_probs.gather(
-                1, response_ids.unsqueeze(-1)
-            ).squeeze(-1)  # [R]
-            per_token[i, :resp_len] = token_lp
-            mask[i, :resp_len] = 1.0
-
-        return per_token, mask
 
     def _batched_sequence_log_probs(
         self,
