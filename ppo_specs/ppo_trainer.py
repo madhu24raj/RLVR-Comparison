@@ -106,6 +106,7 @@ class PPOTrainer:
         critic: nn.Module,
         reward_fn: Callable[[str, str], float],
         device: torch.device,
+        reference_model: Optional[AutoModelForCausalLM] = None,
     ):
         self.config = config
         self.model = model
@@ -113,6 +114,26 @@ class PPOTrainer:
         self.critic = critic
         self.reward_fn = reward_fn
         self.device = device
+
+        # Reference model for KL anchoring (L14). When provided, the
+        # PPO loss includes a `config.reference_kl_coeff * KL(pi_new || pi_ref)`
+        # term that penalises the policy for drifting away from this
+        # frozen snapshot. We force eval mode + no_grad on every parameter
+        # so no gradient can flow back into it under any code path.
+        self.reference_model = reference_model
+        if reference_model is not None:
+            reference_model.eval()
+            for p in reference_model.parameters():
+                p.requires_grad_(False)
+
+        # Sanity: if reference_kl_coeff > 0, the user MUST pass a ref model.
+        if config.reference_kl_coeff > 0 and reference_model is None:
+            raise ValueError(
+                f"reference_kl_coeff={config.reference_kl_coeff} > 0 requires "
+                f"reference_model to be passed to PPOTrainer.__init__. "
+                f"Use load_ppo_trainer() which handles this automatically, "
+                f"or pass reference_model explicitly."
+            )
 
         self.policy_optimizer = torch.optim.AdamW(
             model.parameters(), lr=config.learning_rate
@@ -203,46 +224,100 @@ class PPOTrainer:
 
     # ── Batched helper methods ───────────────────────────────────────────────
 
-    def _batched_sequence_log_probs(
+    def _batched_per_token_log_probs(
         self,
         all_full_ids: List[List[int]],
         prompt_lens: List[int],
-    ) -> torch.Tensor:
-        """Compute sequence log probs for all samples in one forward pass."""
-        # Pad to same length (right-pad with pad_token_id)
+        model_override: Optional[AutoModelForCausalLM] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-token response log-probs for a batch.
+
+        This is the source of truth for the PPO loss: returns the log
+        probability of each *response* token under the current policy,
+        right-padded across the batch, plus a 1/0 mask marking which
+        positions correspond to real tokens.
+
+        Args:
+            all_full_ids:    list of [prompt | response] token id lists
+            prompt_lens:     prompt lengths (so we can slice off the response)
+            model_override:  if provided, run the forward pass through this
+                             model instead of self.model. Used by the
+                             reference-KL code path to compute log probs
+                             under the frozen reference policy without
+                             duplicating this method.
+
+        Returns:
+            log_probs: [B, T_max_response]   per-token log probs (response only)
+            mask:      [B, T_max_response]   1 where real, 0 where padding
+
+        The PPO surrogate loss in ppo_update() uses these to compute
+        token-level ratios. The legacy _batched_sequence_log_probs() sums
+        across T to recover the older sequence-level scalars.
+        """
+        model = model_override if model_override is not None else self.model
+
+        B = len(all_full_ids)
+        # Pad full token ids to the longest sequence in the batch
         max_len = max(len(ids) for ids in all_full_ids)
         padded = torch.full(
-            (len(all_full_ids), max_len), self.tokenizer.pad_token_id,
+            (B, max_len), self.tokenizer.pad_token_id,
             dtype=torch.long, device=self.device,
         )
         attention_mask = torch.zeros(
-            len(all_full_ids), max_len,
-            dtype=torch.long, device=self.device,
+            B, max_len, dtype=torch.long, device=self.device,
         )
         for i, ids in enumerate(all_full_ids):
             padded[i, :len(ids)] = torch.tensor(ids, dtype=torch.long)
             attention_mask[i, :len(ids)] = 1
 
-        outputs = self.model(
+        outputs = model(
             input_ids=padded, attention_mask=attention_mask, use_cache=False,
         )
-        logits = outputs.logits.float()  # CRITICAL: compute log_softmax in fp32
-        log_probs = torch.log_softmax(logits, dim=-1)
+        logits = outputs.logits.float()  # log_softmax in fp32 for stability
+        log_probs_full = torch.log_softmax(logits, dim=-1)  # [B, max_len, V]
 
-        # Extract per-sample response log probs
-        result = []
-        for i in range(len(all_full_ids)):
+        # The longest *response* across the batch sets the [B, T] shape.
+        max_resp_len = max(
+            max(len(all_full_ids[i]) - prompt_lens[i], 0) for i in range(B)
+        )
+        if max_resp_len == 0:
+            # Pathological case: no sample has any response tokens.
+            zeros = torch.zeros((B, 1), device=self.device)
+            return zeros, torch.zeros((B, 1), device=self.device)
+
+        per_token = torch.zeros((B, max_resp_len), device=self.device)
+        mask = torch.zeros((B, max_resp_len), device=self.device)
+
+        for i in range(B):
             pl = prompt_lens[i]
             seq_len = len(all_full_ids[i])
-            if seq_len <= pl:
-                result.append(torch.zeros(1, device=self.device))
+            resp_len = seq_len - pl
+            if resp_len <= 0:
                 continue
-            response_lp = log_probs[i, pl - 1 : seq_len - 1, :]  # [R, V]
+            # logits at positions [pl-1 : seq_len-1] predict tokens [pl : seq_len]
+            response_log_probs = log_probs_full[i, pl - 1 : seq_len - 1, :]  # [R, V]
             response_ids = padded[i, pl:seq_len]  # [R]
-            token_lp = response_lp.gather(1, response_ids.unsqueeze(-1)).squeeze(-1)
-            result.append(token_lp.sum().unsqueeze(0))
+            token_lp = response_log_probs.gather(
+                1, response_ids.unsqueeze(-1)
+            ).squeeze(-1)  # [R]
+            per_token[i, :resp_len] = token_lp
+            mask[i, :resp_len] = 1.0
 
-        return torch.cat(result)  # [B]
+        return per_token, mask
+
+    def _batched_sequence_log_probs(
+        self,
+        all_full_ids: List[List[int]],
+        prompt_lens: List[int],
+    ) -> torch.Tensor:
+        """Sequence-level log prob (sum of per-token response log probs).
+
+        Kept for backward compatibility with existing tests that check
+        sequence-level scalars. The PPO loss path no longer uses this --
+        see _batched_per_token_log_probs and ppo_update.
+        """
+        per_token, mask = self._batched_per_token_log_probs(all_full_ids, prompt_lens)
+        return (per_token * mask).sum(dim=-1)  # [B]
 
     @torch.no_grad()
     def _batched_critic_values(self, prompts: List[str]) -> torch.Tensor:
@@ -301,25 +376,39 @@ class PPOTrainer:
         self,
         batch: RolloutBatch,
         precomputed_advantages: Optional[torch.Tensor] = None,
+        precomputed_old_per_token_log_probs: Optional[torch.Tensor] = None,
+        precomputed_response_mask: Optional[torch.Tensor] = None,
+        precomputed_ref_per_token_log_probs: Optional[torch.Tensor] = None,
     ) -> Dict[str, float]:
-        """
-        One PPO gradient step on the collected batch.
+        """One PPO gradient step on the collected batch (per-token loss).
+
+        The PPO surrogate is computed at the *token* level, matching the
+        TRL/InstructGPT formulation for autoregressive LMs:
+
+            ratio_bt   = exp(new_log_probs_bt - old_log_probs_bt)
+            unclipped  = ratio_bt * A_b
+            clipped    = clip(ratio_bt, 1-eps, 1+eps) * A_b
+            L_pg       = -mean_over_unmasked_tokens(min(unclipped, clipped))
+
+        Sequence-level log ratios (which were used here previously) blow up
+        with response length: even tiny per-token weight changes accumulate
+        across hundreds of tokens. (Empirically: a K=4 run with the old
+        sequence-level loss on this codebase produced kl_divergence ~ 232
+        within 10 steps and immediate policy collapse.) The per-token
+        formulation makes the clip actually do its job.
+
+        For backward compatibility, callers may omit the `precomputed_*`
+        kwargs; in that case we recompute everything from `batch`. The
+        production path (train_step) precomputes them once before the
+        K-epoch loop, matching standard PPO.
 
         Policy and critic losses are computed jointly but gradients are
         separated: critic hidden states are detached from the policy graph
         so L_V does not backpropagate into policy weights.
-
-        Args:
-            batch: Rollout data collected under pi_old.
-            precomputed_advantages: If provided, these fixed advantages are
-                used instead of recomputing from the (now-updated) critic.
-                Standard PPO computes advantages once before the K-epoch
-                optimisation loop (Schulman et al., 2017 Section 4).
         """
         self.model.train()
 
         rewards = batch.rewards().to(self.device)
-        old_log_probs = batch.old_log_probs().to(self.device)
 
         # ── Critic forward pass (with grad, detached from policy) ─────────────
         critic_values, critic_loss = self._critic_forward(batch, rewards)
@@ -336,27 +425,74 @@ class PPOTrainer:
                 normalize=True,
             )
 
-        # ── Policy forward pass (with grad, batched) ─────────────────────────
-        new_log_probs = self._policy_log_probs(batch)
+        # ── Per-token old log probs and response mask ────────────────────────
+        if (precomputed_old_per_token_log_probs is not None
+                and precomputed_response_mask is not None):
+            old_per_token = precomputed_old_per_token_log_probs.detach()
+            mask = precomputed_response_mask.detach()
+        else:
+            with torch.no_grad():
+                old_per_token, mask = self._batched_per_token_log_probs(
+                    [r.full_ids for r in batch.rollouts],
+                    [r.prompt_len for r in batch.rollouts],
+                )
+            old_per_token = old_per_token.detach()
+            mask = mask.detach()
 
-        log_ratio = new_log_probs - old_log_probs.detach()
+        # ── Policy forward pass: per-token NEW log probs (with grad) ─────────
+        # The response mask is purely a function of token positions, not policy
+        # params, so we discard the mask from this call and reuse `mask`.
+        new_per_token, _ = self._batched_per_token_log_probs(
+            [r.full_ids for r in batch.rollouts],
+            [r.prompt_len for r in batch.rollouts],
+        )
+
+        # ── Per-token PPO surrogate ──────────────────────────────────────────
+        log_ratio = new_per_token - old_per_token            # [B, T]
         log_ratio = torch.clamp(log_ratio, -self.config.log_ratio_clip, self.config.log_ratio_clip)
-        ratio = torch.exp(log_ratio)
+        ratio = torch.exp(log_ratio)                         # [B, T]
+        A_expanded = advantages.unsqueeze(-1)                # [B, 1] -> broadcasts over T
+
+        unclipped = ratio * A_expanded
         clipped = torch.clamp(
             ratio, 1.0 - self.config.clip_epsilon, 1.0 + self.config.clip_epsilon
-        )
-        policy_loss = -torch.mean(torch.min(ratio * advantages, clipped * advantages))
+        ) * A_expanded
+        per_token_pg = -torch.min(unclipped, clipped)        # [B, T]
 
-        # ── KL divergence penalty ─────────────────────────────────────────────
+        # Masked mean over the unmasked tokens (TRL standard)
+        mask_sum = mask.sum().clamp(min=1.0)
+        policy_loss = (per_token_pg * mask).sum() / mask_sum
+
+        # ── KL penalty (per-token, masked) ───────────────────────────────────
         # KL(pi_old || pi_new) = E_{pi_old}[log pi_old - log pi_new]
-        # This is the correct direction: penalises the new policy for
-        # moving away from the old policy under which data was collected.
-        kl = (old_log_probs.detach() - new_log_probs).mean()
+        # NOTE: this is now PER-TOKEN KL, not sequence-level. Numbers from
+        # this metric are NOT comparable to pre-refactor logs which used
+        # sequence-level KL (which routinely hit ~10^2 per sequence in our
+        # broken K=4 run). Per-token KL should stay << 1.0 in healthy PPO.
+        kl_per_token = (old_per_token - new_per_token) * mask  # [B, T]
+        kl = kl_per_token.sum() / mask_sum
+
+        # ── Reference KL anchor (L14) ────────────────────────────────────────
+        # KL(pi_new || pi_ref) where pi_ref is a frozen snapshot of the
+        # initial policy. This penalises the policy for drifting away from
+        # its starting distribution -- the standard RLHF "anchor" term.
+        # Estimator: mean(new_log_prob - ref_log_prob) per token, masked.
+        # We use this direction (KL(new||ref)) rather than KL(ref||new)
+        # because our token sequences are sampled from the current policy,
+        # making the KL(new||ref) Monte Carlo estimator unbiased
+        # (TRL/InstructGPT convention).
+        kl_ref = torch.tensor(0.0, device=self.device)
+        if (precomputed_ref_per_token_log_probs is not None
+                and self.config.reference_kl_coeff > 0):
+            ref_per_token = precomputed_ref_per_token_log_probs.detach()
+            kl_ref_per_token = (new_per_token - ref_per_token) * mask  # [B, T]
+            kl_ref = kl_ref_per_token.sum() / mask_sum
 
         # ── Combined loss and backward ────────────────────────────────────────
         total_loss = (policy_loss
                       + self.config.critic_loss_coeff * critic_loss
-                      + self.config.kl_coeff * kl)
+                      + self.config.kl_coeff * kl
+                      + self.config.reference_kl_coeff * kl_ref)
 
         self.policy_optimizer.zero_grad()
         if self.critic_optimizer:
@@ -364,7 +500,14 @@ class PPOTrainer:
 
         total_loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.grad_clip_norm)
+        # Clip and capture grad norm BEFORE the optimizer step.
+        # The metric reports the *pre-clip* L2 norm so it's informative even
+        # when clipping engages. We need this because policy_loss is ~0 when
+        # the new and old policies match exactly (same model state at start
+        # of epoch 1) and is therefore not a useful health signal on its own.
+        policy_grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.model.parameters(), max_norm=self.config.grad_clip_norm,
+        )
         if self.critic.is_trainable():
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=self.config.grad_clip_norm)
         self.policy_optimizer.step()
@@ -373,15 +516,20 @@ class PPOTrainer:
 
         # Use detached ratio for metrics to avoid retaining the computation graph
         ratio_detached = ratio.detach()
+        # clip_fraction is now per-token over unmasked positions
+        clip_hits = ((ratio_detached - 1.0).abs() > self.config.clip_epsilon).float()
+        clip_fraction = (clip_hits * mask).sum() / mask_sum
+
         return {
             "policy_loss": policy_loss.item(),
+            "policy_grad_norm": float(policy_grad_norm),
             "critic_loss": critic_loss.item(),
             "kl_divergence": kl.item(),
+            "kl_ref_divergence": kl_ref.item(),
             "mean_reward": rewards.mean().item(),
             "reward_variance": rewards.var().item(),
             "mean_advantage": advantages.mean().item(),
-            "clip_fraction": ((ratio_detached - 1.0).abs() > self.config.clip_epsilon)
-                             .float().mean().item(),
+            "clip_fraction": clip_fraction.item(),
         }
 
     def _policy_log_probs(self, batch: RolloutBatch) -> torch.Tensor:
@@ -432,14 +580,19 @@ class PPOTrainer:
     ) -> Dict[str, float]:
         """Single PPO iteration: collect rollouts → K gradient updates.
 
-        Advantages are computed ONCE from the initial critic values and held
-        fixed across all K PPO epochs, matching the standard PPO algorithm
-        (Schulman et al., 2017).  Recomputing advantages each epoch with
-        updated critic weights would introduce a moving optimisation target.
+        Advantages AND per-token old log probs are computed ONCE before
+        the K-epoch loop and held fixed across all K updates, matching
+        the standard PPO algorithm (Schulman et al., 2017). Recomputing
+        either each epoch with updated weights would introduce a moving
+        optimisation target.
+
+        The per-token old log probs are what make the K>=2 PPO ratios
+        meaningful: by epoch 2, the model has moved, so new_log_probs
+        differ from these frozen old_log_probs and the ratio is non-trivial.
         """
         batch = self.generate_rollouts(prompts, ground_truths)
 
-        # ── Compute advantages once, before any gradient updates ─────────
+        # ── Freeze advantages once, before any gradient updates ─────────
         rewards = batch.rewards().to(self.device)
         with torch.no_grad():
             critic_values_init, _ = self._critic_forward(batch, rewards)
@@ -451,9 +604,38 @@ class PPOTrainer:
             normalize=True,
         )
 
+        # ── Freeze per-token old log probs once, before any gradient updates ─
+        with torch.no_grad():
+            fixed_old_per_token, fixed_response_mask = self._batched_per_token_log_probs(
+                [r.full_ids for r in batch.rollouts],
+                [r.prompt_len for r in batch.rollouts],
+            )
+        fixed_old_per_token = fixed_old_per_token.detach()
+        fixed_response_mask = fixed_response_mask.detach()
+
+        # ── Freeze per-token reference log probs once (L14 anchor) ──────────
+        # Only computed when reference KL is enabled. The reference model
+        # is frozen for the entire run, so its log probs depend only on the
+        # rollout token ids -- not on the K-epoch loop iteration.
+        fixed_ref_per_token: Optional[torch.Tensor] = None
+        if self.reference_model is not None and self.config.reference_kl_coeff > 0:
+            with torch.no_grad():
+                ref_per_token, _ = self._batched_per_token_log_probs(
+                    [r.full_ids for r in batch.rollouts],
+                    [r.prompt_len for r in batch.rollouts],
+                    model_override=self.reference_model,
+                )
+            fixed_ref_per_token = ref_per_token.detach()
+
         all_metrics: List[Dict[str, float]] = []
         for epoch in range(self.config.n_ppo_epochs):
-            metrics = self.ppo_update(batch, precomputed_advantages=fixed_advantages)
+            metrics = self.ppo_update(
+                batch,
+                precomputed_advantages=fixed_advantages,
+                precomputed_old_per_token_log_probs=fixed_old_per_token,
+                precomputed_response_mask=fixed_response_mask,
+                precomputed_ref_per_token_log_probs=fixed_ref_per_token,
+            )
             all_metrics.append(metrics)
 
         # Average scalar metrics over epochs
@@ -558,6 +740,23 @@ def load_ppo_trainer(config: PPOConfig, device: torch.device) -> PPOTrainer:
     critic = build_critic(config.critic_capacity, hidden_size)
     critic = critic.to(device)  # stays float32
 
+    # Load reference model for KL anchoring (L14) when enabled.
+    # NOTE: this loads a SECOND copy of the model -- roughly doubling
+    # parameter memory. On a single GPU with an 8B model in bf16 this
+    # is ~16 GB extra. We do not enable gradient checkpointing on the
+    # reference model because it never sees gradients.
+    reference_model = None
+    if config.reference_kl_coeff > 0:
+        print(f"[PPO] reference_kl_coeff={config.reference_kl_coeff} > 0; "
+              f"loading frozen reference model (doubles weight memory)")
+        reference_model = AutoModelForCausalLM.from_pretrained(
+            config.model_name,
+            dtype=torch_dtype,
+        ).to(device)
+        reference_model.eval()
+        for p in reference_model.parameters():
+            p.requires_grad_(False)
+
     return PPOTrainer(
         config=config,
         model=model,
@@ -565,4 +764,5 @@ def load_ppo_trainer(config: PPOConfig, device: torch.device) -> PPOTrainer:
         critic=critic,
         reward_fn=gsm8k_reward,
         device=device,
+        reference_model=reference_model,
     )

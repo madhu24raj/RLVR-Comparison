@@ -35,8 +35,21 @@ class PPOConfig:
     critic_lr: float = 1e-4
     clip_epsilon: float = 0.2       # PPO surrogate clipping
     gamma: float = 1.0              # single-step episodes; gamma is unused
-    n_ppo_epochs: int = 1           # gradient steps per collected batch
-    kl_coeff: float = 0.0           # optional KL penalty weight (off by default)
+    n_ppo_epochs: int = 4           # PPO epochs per collected batch (TRL/InstructGPT
+                                     # standard). With per-token PPO loss the surrogate
+                                     # is well-behaved at K>=2; at K=1 the ratio is
+                                     # identically 1.0 on the first pass so the printed
+                                     # policy_loss is ~0 (gradient is still real;
+                                     # see policy_grad_norm metric).
+    kl_coeff: float = 0.0           # weight on per-step KL(pi_old || pi_new),
+                                     # the within-batch trust-region penalty
+    reference_kl_coeff: float = 0.0  # weight on KL(pi_new || pi_ref) where pi_ref
+                                     # is a frozen copy of the model from before
+                                     # training started. Anchors the policy against
+                                     # drift away from the initial distribution.
+                                     # Default 0 = off (loads no extra model).
+                                     # Standard RLHF uses ~0.01-0.1. Setting > 0
+                                     # roughly doubles VRAM (loads a second model).
     critic_loss_coeff: float = 0.5  # weight on critic MSE loss in total_loss
     grad_clip_norm: float = 1.0     # max gradient norm for policy and critic
     log_ratio_clip: float = 20.0    # clamp log-ratio before exp() to prevent overflow
@@ -111,7 +124,7 @@ def local_test_config() -> PPOConfig:
         model_name="Qwen/Qwen2.5-0.5B-Instruct",
         n_steps=5,
         batch_size=4,
-        max_new_tokens=64,
+        max_new_tokens=256,
         n_train_samples=20,
         n_test_samples=50,        # smoke test only needs a tiny test pool
         eval_size=10,             # tiny: pipeline check, not signal
@@ -136,6 +149,13 @@ def e2_7_config(seed: int = 42) -> PPOConfig:
         final_eval_size=500,      # full reported number
         eval_every=20,
         log_every=5,
+        # Reference KL anchor (L14). 0.01 follows DeepSeekMath's RLVR
+        # default lowered slightly for our smaller model scale. Anchors
+        # the policy against drift away from the initial distribution
+        # over 200 steps; without it we observed clip_fraction climb to
+        # ~0.5 and per-token KL to ~1.0 by step 24 of a local run.
+        # Doubles model VRAM (loads a frozen reference copy).
+        reference_kl_coeff=0.01,
         seed=seed,
         experiment_name=f"ppo_e2_7_seed{seed}",
     )
@@ -155,6 +175,7 @@ def e2_8_config(critic_capacity: str = "medium", seed: int = 42) -> PPOConfig:
         final_eval_size=500,
         eval_every=20,
         log_every=10,
+        reference_kl_coeff=0.01,  # see e2_7_config for justification
         seed=seed,
         experiment_name=f"ppo_e2_8_{critic_capacity}_seed{seed}",
     )

@@ -143,10 +143,13 @@ def run_one_capacity(
                 mean_reward=metrics["mean_reward"],
                 policy_loss=metrics["policy_loss"],
                 critic_loss=metrics["critic_loss"],
+                kl_divergence=metrics["kl_divergence"],
+                kl_ref_divergence=metrics["kl_ref_divergence"],
             )
             print(
                 f"  step {step:3d} | test_acc={test_acc:.3f} "
-                f"| εV={ev:.4f} | bias={bias:.4f}"
+                f"| εV={ev:.4f} | bias={bias:.4f} "
+                f"| kl={metrics['kl_divergence']:.4f}"
             )
 
     logger.save()

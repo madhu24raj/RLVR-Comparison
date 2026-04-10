@@ -41,14 +41,20 @@ def load_gsm8k(split: str = "train", n_samples: int = None, seed: int = 42):
 
 
 def format_prompt(question: str, system_prompt: str = None) -> str:
-    """Format a GSM8K question as a chat-style prompt.
+    """Format a GSM8K question as a plain-text prompt.
 
-    Compatible with Qwen and Llama chat templates.
+    Used by callers that don't have a tokenizer with apply_chat_template,
+    or that want a plain-text format. Kept consistent with
+    format_prompt_with_template's default system prompt so the two
+    produce identical fallback strings.
     """
     if system_prompt is None:
+        # Same default system prompt as format_prompt_with_template -- see
+        # the comment there for the empirical justification (Qwen2.5-0.5B
+        # ignores #### but emits \boxed{} unprompted).
         system_prompt = (
             "Solve this math problem step by step. "
-            "Put your final numerical answer after ####."
+            "Put your final numerical answer in \\boxed{}."
         )
     return f"{system_prompt}\n\nQuestion: {question}\n\nAnswer:"
 
