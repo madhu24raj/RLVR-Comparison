@@ -259,7 +259,7 @@ class TestGRPOEndToEnd:
         from grpo_specs.grpo_trainer import load_grpo_trainer
         config = local_test_config()
         config.n_steps = 1
-        device = torch.device("cpu")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return load_grpo_trainer(config, device)
 
     def test_train_step_produces_metrics(self, trainer):
