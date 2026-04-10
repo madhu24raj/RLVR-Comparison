@@ -124,7 +124,7 @@ def local_test_config() -> PPOConfig:
         model_name="Qwen/Qwen2.5-0.5B-Instruct",
         n_steps=5,
         batch_size=4,
-        max_new_tokens=64,
+        max_new_tokens=256,
         n_train_samples=20,
         n_test_samples=50,        # smoke test only needs a tiny test pool
         eval_size=10,             # tiny: pipeline check, not signal
