@@ -31,3 +31,7 @@ wandb/
 # Model / data caches
 .cache/
 checkpoints/
+.model_cache/
+
+# Claude Code
+CLAUDE.md
