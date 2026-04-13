@@ -29,7 +29,7 @@ def run_dpo_e2_7(config):
     
     print(f"[E2.7 DPO] Loading Data...")
     train_ds = load_gsm8k("train", n_samples=config.n_train_samples, seed=config.seed)
-    test_ds  = load_gsm8k("test",  n_samples=200)
+    test_ds  = load_gsm8k("test",  n_samples=config.n_test_samples) # Fixed: 200 -> config.n_test_samples
 
     train_prompts = [format_prompt(ex["question"]) for ex in train_ds]
     train_gts     = [ex["ground_truth"] for ex in train_ds]
@@ -78,7 +78,8 @@ def run_dpo_e2_7(config):
             )
 
         if step % config.eval_every == 0:
-            test_acc = trainer.evaluate(test_prompts, test_gts, n_eval=20)
+            # Fixed: 20 -> config.eval_size
+            test_acc = trainer.evaluate(test_prompts, test_gts, n_eval=config.eval_size)
             window = reward_window[-config.eval_every:] if len(reward_window) >= config.eval_every else reward_window
             stability = float(np.var(window))
 
@@ -95,7 +96,9 @@ def run_dpo_e2_7(config):
             print(f"    -> test_acc={test_acc:.3f} | stability(var)={stability:.4f}")
 
     logger.save()
-    final_acc = trainer.evaluate(test_prompts, test_gts, n_eval=50)
+    
+    # Fixed: 50 -> config.final_eval_size
+    final_acc = trainer.evaluate(test_prompts, test_gts, n_eval=config.final_eval_size)
     print(f"\n[E2.7 DPO] Final test accuracy: {final_acc:.3f}")
 
 if __name__ == "__main__":
