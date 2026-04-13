@@ -10,7 +10,7 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from src.data import load_gsm8k, format_prompt
+from src.data import load_gsm8k, format_prompt, format_prompt_with_template
 from src.rewards import gsm8k_reward
 from eval.metrics import ExperimentLogger
 from ppo_specs.utils import cycle_batch
