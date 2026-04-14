@@ -47,7 +47,11 @@ from typing import Callable, Dict, List, Optional, Tuple
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.data import load_gsm8k, format_prompt
-from src.rewards import gsm8k_reward
+from src.rewards import (
+    gsm8k_reward,
+    extract_answer_from_completion,
+    matches_boxed_format,
+)
 from eval.metrics import ExperimentLogger
 from eval.metrics import accuracy as compute_accuracy
 
@@ -72,6 +76,10 @@ class Rollout:
     value: float             # V̂(s) from critic (or 0.0 for REINFORCE)
     full_ids: List[int]      # full token ids: [prompt | response]
     prompt_len: int          # number of prompt tokens
+    # Phase-1 reward-starvation diagnostics (populated at generation time).
+    # Defaults keep existing positional Rollout(...) construction in tests working.
+    parse_success: bool = False       # extract_answer_from_completion(...) returned a value
+    format_match_boxed: bool = False  # completion contains \boxed{...}
 
 
 @dataclass
@@ -200,6 +208,12 @@ class PPOTrainer:
             )
             reward = self.reward_fn(completion, ground_truths[i])
 
+            # Phase-1 diagnostics: is the model producing parseable output?
+            # Computed on the same completion string the reward sees, so rates
+            # are directly comparable to reward_nonzero_rate.
+            parse_success = extract_answer_from_completion(completion) is not None
+            format_match_boxed = matches_boxed_format(completion)
+
             rollouts.append(Rollout(
                 prompt=prompts[i],
                 completion=completion,
@@ -208,6 +222,8 @@ class PPOTrainer:
                 value=0.0,         # computed below in batch
                 full_ids=full_ids.tolist(),
                 prompt_len=prompt_len,
+                parse_success=parse_success,
+                format_match_boxed=format_match_boxed,
             ))
 
         # Batch compute old log probs
@@ -585,6 +601,20 @@ class PPOTrainer:
         }
         aggregated["accuracy"] = compute_accuracy(
             [r.reward for r in batch.rollouts]
+        )
+        # Phase-1 reward-starvation diagnostics (batch-level rates).
+        # reward_nonzero_rate equals accuracy under the current binary reward,
+        # but is tracked as a separate column so it remains meaningful once
+        # the reward source is swapped for a continuous learned RM (Phase 4).
+        n = len(batch.rollouts)
+        aggregated["parse_success_rate"] = (
+            sum(r.parse_success for r in batch.rollouts) / n if n else 0.0
+        )
+        aggregated["format_match_rate"] = (
+            sum(r.format_match_boxed for r in batch.rollouts) / n if n else 0.0
+        )
+        aggregated["reward_nonzero_rate"] = (
+            sum(r.reward > 0 for r in batch.rollouts) / n if n else 0.0
         )
         aggregated["total_rollouts"] = self.total_rollouts
         self.step += 1

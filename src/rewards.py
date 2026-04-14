@@ -52,6 +52,18 @@ def extract_answer_from_completion(completion: str) -> str:
     return None
 
 
+def matches_boxed_format(completion: str) -> bool:
+    """True iff the completion contains a `\\boxed{...}` anchor.
+
+    Diagnostic helper for reward-starvation debugging: we ask the model
+    to emit `\\boxed{}` in the system prompt (higher parse rate than
+    `####` on Qwen2.5-0.5B), so this rate tracks whether the model is
+    obeying the prompt format. Distinct from `extract_answer_from_completion`,
+    which also accepts `####` and "the answer is" forms.
+    """
+    return re.search(r"\\boxed\{[^}]+\}", completion) is not None
+
+
 def normalize_number(s: str) -> float:
     """Normalize a number string for comparison.
 

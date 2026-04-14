@@ -145,6 +145,10 @@ def run_one_capacity(
                 critic_loss=metrics["critic_loss"],
                 kl_divergence=metrics["kl_divergence"],
                 kl_ref_divergence=metrics["kl_ref_divergence"],
+                # Phase-1 reward-starvation diagnostics
+                parse_success_rate=metrics["parse_success_rate"],
+                format_match_rate=metrics["format_match_rate"],
+                reward_nonzero_rate=metrics["reward_nonzero_rate"],
             )
             print(
                 f"  step {step:3d} | test_acc={test_acc:.3f} "

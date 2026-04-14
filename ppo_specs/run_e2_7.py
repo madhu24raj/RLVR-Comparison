@@ -156,6 +156,8 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
             print(
                 f"  step {step:3d} | reward={metrics['mean_reward']:.3f} "
                 f"| acc={metrics['accuracy']:.3f} "
+                f"| parse={metrics['parse_success_rate']:.2f} "
+                f"| boxed={metrics['format_match_rate']:.2f} "
                 f"| policy_loss={metrics['policy_loss']:.4f} "
                 f"| critic_loss={metrics['critic_loss']:.4f} "
                 f"| kl={metrics['kl_divergence']:.4f}"
@@ -210,6 +212,10 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
                 "clip_fraction":  metrics["clip_fraction"],
                 "kl_divergence":  metrics["kl_divergence"],
                 "kl_ref_divergence": metrics["kl_ref_divergence"],
+                # Phase-1 reward-starvation diagnostics
+                "parse_success_rate":  metrics["parse_success_rate"],
+                "format_match_rate":   metrics["format_match_rate"],
+                "reward_nonzero_rate": metrics["reward_nonzero_rate"],
             }
             if adv_error is not None:
                 log_entry["advantage_error"] = adv_error       # (iv)
