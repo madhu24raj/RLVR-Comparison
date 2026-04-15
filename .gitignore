@@ -36,3 +36,6 @@ checkpoints/
 # Claude Code
 CLAUDE.md
 RLVR_VAULT/
+
+# Git worktrees
+.worktrees/
