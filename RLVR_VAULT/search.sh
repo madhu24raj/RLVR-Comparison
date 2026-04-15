@@ -22,4 +22,9 @@ if [[ ! -d "$TARGET" ]]; then
   exit 1
 fi
 
-rg --color=never --heading --line-number "$QUERY" "$TARGET"
+# Resolve rg: prefer CLAUDE_CODE_EXECPATH (acts as rg when ARGV0=rg), else system rg
+if [[ -x "${CLAUDE_CODE_EXECPATH:-}" ]]; then
+  ARGV0=rg "$CLAUDE_CODE_EXECPATH" --color=never --heading --line-number "$QUERY" "$TARGET"
+else
+  rg --color=never --heading --line-number "$QUERY" "$TARGET"
+fi

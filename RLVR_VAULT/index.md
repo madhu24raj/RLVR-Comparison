@@ -39,7 +39,7 @@ Search wiki: `./search.sh "query" [subdir]`
 
 ## Sources
 
-_(populated on first ingest)_
+- [[project-notes-initial]] — Initial project planning notes: experiment scope (2.7/2.8/2.9), methods, benchmarks, task ownership
 
 ---
 

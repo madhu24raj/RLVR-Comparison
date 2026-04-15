@@ -8,3 +8,5 @@ Parse recent entries: `grep "^## \[" log.md | tail -10`
 ---
 
 ## [2026-04-15] ingest | Wiki initialization — seed pages and schema
+
+## [2026-04-15] ingest | Project Notes — Initial Planning Notes
