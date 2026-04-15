@@ -1,112 +1,147 @@
-import sys
-import os
-import argparse
 import torch
 import numpy as np
-import random
-from transformers import AutoModelForCausalLM, AutoTokenizer, set_seed
+from typing import List, Dict
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trl import DPOTrainer, DPOConfig
+from datasets import Dataset
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
-
-from src.data import load_gsm8k, format_prompt, format_prompt_with_template
 from src.rewards import gsm8k_reward
-from eval.metrics import ExperimentLogger
-from ppo_specs.utils import cycle_batch
-from ppo_specs.config import local_test_config, e2_7_config
+from src.dpo_pairs import construct_pairs_from_batch, pairs_to_dataset
+from eval.metrics import accuracy as compute_accuracy
 
-from dpo_specs.dpo_trainer import IterativeDPOTrainer
+class IterativeDPOTrainer:
+    def __init__(self, config, model, ref_model, tokenizer, reward_fn, device):
+        self.config = config
+        self.model = model
+        self.ref_model = ref_model  # DPO requires a frozen reference model
+        self.tokenizer = tokenizer
+        self.reward_fn = reward_fn
+        self.device = device
+        
+        self.total_rollouts = 0
+        self.step = 0
 
-def run_dpo_e2_7(config):
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 1. Reproducibility
-    random.seed(config.seed)
-    torch.manual_seed(config.seed)
-    np.random.seed(config.seed)
-    set_seed(config.seed)
-    
-    print(f"[E2.7 DPO] Loading Data...")
-    train_ds = load_gsm8k("train", n_samples=config.n_train_samples, seed=config.seed)
-    test_ds  = load_gsm8k("test",  n_samples=config.n_test_samples) # Fixed: 200 -> config.n_test_samples
+    def train_step(self, prompts: List[str], ground_truths: List[str]) -> Dict[str, float]:
+        self.model.eval()
+        
+        # CRITICAL FIX: DPO needs multiple completions per prompt to form chosen/rejected pairs!
+        n_rollouts = 4  # Generate 4 attempts per prompt to create contrastive pairs
+        expanded_prompts = [p for p in prompts for _ in range(n_rollouts)]
+        expanded_gts = [gt for gt in ground_truths for _ in range(n_rollouts)]
+        
+        completions = []
+        rewards = []
+        
+        # 1. Generate rollouts (Micro-batched to prevent GPU OOM)
+        chunk_size = 8 
+        for i in range(0, len(expanded_prompts), chunk_size):
+            chunk_p = expanded_prompts[i:i+chunk_size]
+            chunk_gt = expanded_gts[i:i+chunk_size]
+            
+            enc = self.tokenizer(
+                chunk_p, return_tensors="pt", truncation=True, max_length=512, padding=True
+            ).to(self.device)
+            
+            with torch.no_grad():
+                out = self.model.generate(
+                    input_ids=enc["input_ids"],
+                    attention_mask=enc["attention_mask"],
+                    max_new_tokens=self.config.max_new_tokens,
+                    do_sample=self.config.do_sample,
+                    temperature=self.config.temperature,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+                
+            prompt_lens = enc["attention_mask"].sum(dim=1).tolist()
+            
+            for j in range(len(chunk_p)):
+                pl = prompt_lens[j]
+                pad_len = (enc["input_ids"][j] == self.tokenizer.pad_token_id).sum().item()
+                real_start = pad_len
+                
+                completion = self.tokenizer.decode(out[j][real_start + pl:], skip_special_tokens=True)
+                completions.append(completion)
+                rewards.append(self.reward_fn(completion, chunk_gt[j]))
 
-    train_prompts = [format_prompt(ex["question"]) for ex in train_ds]
-    train_gts     = [ex["ground_truth"] for ex in train_ds]
-    test_prompts  = [format_prompt(ex["question"]) for ex in test_ds]
-    test_gts      = [ex["ground_truth"] for ex in test_ds]
-
-    print(f"[E2.7 DPO] Loading Models...")
-    torch_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "left"
-
-    # DPO requires both a policy model and a frozen reference model
-    model = AutoModelForCausalLM.from_pretrained(config.model_name, dtype=torch_dtype).to(device)
-    ref_model = AutoModelForCausalLM.from_pretrained(config.model_name, dtype=torch_dtype).to(device)
-    ref_model.eval()
-
-    trainer = IterativeDPOTrainer(
-        config=config,
-        model=model,
-        ref_model=ref_model,
-        tokenizer=tokenizer,
-        reward_fn=gsm8k_reward,
-        device=device
-    )
-
-    logger = ExperimentLogger(f"{config.experiment_name}_DPO", config.output_dir)
-    reward_window = []
-
-    print("[E2.7 DPO] Starting Training Loop...")
-    for step in range(config.n_steps):
-        batch_p  = cycle_batch(train_prompts, step, config.batch_size)
-        batch_gt = cycle_batch(train_gts,     step, config.batch_size)
-
-        metrics = trainer.train_step(batch_p, batch_gt)
-        reward_window.append(metrics["mean_reward"])
-
-        if step % config.log_every == 0:
-            print(
-                f"  step {step:3d} | reward={metrics['mean_reward']:.3f} "
-                f"| acc={metrics['accuracy']:.3f} "
-                f"| dpo_loss={metrics['dpo_loss']:.4f} "
-                f"| pairs={metrics['valid_pairs']}"
+        self.total_rollouts += len(expanded_prompts)
+        
+        # 2. Construct DPO Preference Pairs
+        pairs = construct_pairs_from_batch(
+            expanded_prompts, completions, rewards, strategy="all", seed=self.config.seed + self.step
+        )
+        
+        metrics = {
+            "mean_reward": float(np.mean(rewards)),
+            "reward_variance": float(np.var(rewards)) if len(rewards) > 1 else 0.0,
+            "accuracy": compute_accuracy(rewards),
+            "total_rollouts": self.total_rollouts,
+            "valid_pairs": len(pairs),
+            "dpo_loss": 0.0,
+            "kl_ref_divergence": 0.0, # Added for tracking
+            "kl_divergence": 0.0      # Mirrored so the PPO logging script doesn't crash
+        }
+        
+        # 3. DPO Update (if valid pairs exist)
+        if pairs:
+            self.model.train()
+            pair_dict = pairs_to_dataset(pairs)
+            dataset = Dataset.from_dict(pair_dict)
+            
+            dpo_config = DPOConfig(
+                learning_rate=self.config.learning_rate,
+                per_device_train_batch_size=max(1, len(pairs) // 2), 
+                max_length=1024,
+                max_prompt_length=512,
+                beta=0.1, # DPO KL penalty parameter
+                report_to="none",
+                remove_unused_columns=False,
+                logging_steps=1, # CRITICAL: Forces TRL to save metrics to its log_history
             )
-
-        if step % config.eval_every == 0:
-            # Fixed: 20 -> config.eval_size
-            test_acc = trainer.evaluate(test_prompts, test_gts, n_eval=config.eval_size)
-            window = reward_window[-config.eval_every:] if len(reward_window) >= config.eval_every else reward_window
-            stability = float(np.var(window))
-
-            logger.log_step(
-                step,
-                total_rollouts=metrics["total_rollouts"],
-                train_accuracy=metrics["accuracy"],
-                test_accuracy=test_acc,
-                reward_variance=stability,
-                dpo_loss=metrics["dpo_loss"],
-                valid_pairs=metrics["valid_pairs"]
+            
+            trainer = DPOTrainer(
+                model=self.model,
+                ref_model=self.ref_model,
+                args=dpo_config,
+                train_dataset=dataset,
+                tokenizer=self.tokenizer,
             )
-            logger.save()
-            print(f"    -> test_acc={test_acc:.3f} | stability(var)={stability:.4f}")
+            
+            train_result = trainer.train()
+            metrics["dpo_loss"] = train_result.training_loss
+            
+            # 4. Extract KL Divergence from TRL's internal logs
+            if trainer.state.log_history:
+                for log in reversed(trainer.state.log_history):
+                    if "rewards/chosen" in log:
+                        # TRL logs 'rewards/chosen' which mathematically is: beta * (log_pi - log_ref)
+                        # Dividing by beta isolates the pure KL divergence!
+                        kl_ref = float(log["rewards/chosen"] / dpo_config.beta)
+                        metrics["kl_ref_divergence"] = kl_ref
+                        metrics["kl_divergence"] = kl_ref
+                        break
+            
+        self.step += 1
+        return metrics
 
-    logger.save()
-    
-    # Fixed: 50 -> config.final_eval_size
-    final_acc = trainer.evaluate(test_prompts, test_gts, n_eval=config.final_eval_size)
-    print(f"\n[E2.7 DPO] Final test accuracy: {final_acc:.3f}")
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="E2.7: DPO head-to-head on GSM8K")
-    parser.add_argument("--local-test", action="store_true")
-    parser.add_argument("--seed", type=int, default=42)
-    args = parser.parse_args()
-
-    cfg = local_test_config() if args.local_test else e2_7_config(seed=args.seed)
-    cfg.seed = args.seed
-    run_dpo_e2_7(cfg)
+    @torch.no_grad()
+    def evaluate(self, prompts: List[str], ground_truths: List[str], n_eval: int = 50) -> float:
+        self.model.eval()
+        eval_prompts = prompts[:n_eval]
+        eval_gts = ground_truths[:n_eval]
+        
+        enc = self.tokenizer(eval_prompts, return_tensors="pt", truncation=True, max_length=512, padding=True).to(self.device)
+        out = self.model.generate(
+            **enc,
+            max_new_tokens=self.config.max_new_tokens,
+            do_sample=False, # Greedy
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+        
+        rewards = []
+        prompt_lens = enc["attention_mask"].sum(dim=1).tolist()
+        for i in range(len(eval_prompts)):
+            pad_len = (enc["input_ids"][i] == self.tokenizer.pad_token_id).sum().item()
+            completion = self.tokenizer.decode(out[i][pad_len + prompt_lens[i]:], skip_special_tokens=True)
+            rewards.append(self.reward_fn(completion, eval_gts[i]))
+            
+        return compute_accuracy(rewards)
