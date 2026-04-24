@@ -87,7 +87,7 @@ def run_one_capacity(
         experiment_name=f"ppo_e2_8_{capacity}_seed{base_config.seed}",
     )
 
-    trainer = load_ppo_trainer(cfg, device)
+    trainer, _ = load_ppo_trainer(cfg, device)
     logger  = ExperimentLogger(cfg.experiment_name, cfg.output_dir)
 
     accuracy_curve: list[tuple[int, float]] = []
@@ -197,7 +197,7 @@ def run_e2_8(config: PPOConfig, capacities: list[str]) -> None:
     # Load a temporary trainer first so we can use its tokenizer's chat template
     # for prompt formatting (L12). Reused below for MC baseline estimation.
     tmp_cfg     = copy_config(config, critic_capacity="none")
-    tmp_trainer = load_ppo_trainer(tmp_cfg, device)
+    tmp_trainer, _ = load_ppo_trainer(tmp_cfg, device)
 
     train_prompts = [
         format_prompt_with_template(ex["question"], tmp_trainer.tokenizer) for ex in train_ds

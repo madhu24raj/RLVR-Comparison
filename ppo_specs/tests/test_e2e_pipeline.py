@@ -77,7 +77,7 @@ def device():
 def shared_trainer(device):
     """Load the model once and share across all tests in this module."""
     cfg = _tiny_config(critic_capacity="medium")
-    trainer = load_ppo_trainer(cfg, device)
+    trainer, _ = load_ppo_trainer(cfg, device)
     return trainer
 
 
@@ -178,7 +178,7 @@ class TestE2EPipeline:
             experiment_name="test_ckpt",
             output_dir=str(tmp_path / "results"),
         )
-        trainer = load_ppo_trainer(cfg, device)
+        trainer, _ = load_ppo_trainer(cfg, device)
         logger = ExperimentLogger(cfg.experiment_name, cfg.output_dir)
 
         prompts = data["train_prompts"][:2]
@@ -198,7 +198,7 @@ class TestE2EPipeline:
 
         # Load checkpoint into fresh trainer
         state = load_checkpoint(ckpt_path, cfg, device)
-        trainer2 = load_ppo_trainer(cfg, device)
+        trainer2, _ = load_ppo_trainer(cfg, device)
 
         from transformers import AutoModelForCausalLM
         trainer2.model = AutoModelForCausalLM.from_pretrained(
@@ -296,7 +296,7 @@ class TestE2EPipeline:
                 critic_capacity=capacity,
                 experiment_name=f"test_cap_{capacity}",
             )
-            trainer = load_ppo_trainer(cfg, device)
+            trainer, _ = load_ppo_trainer(cfg, device)
             metrics = trainer.train_step(prompts, gts)
 
             assert _all_finite(metrics), (
@@ -338,13 +338,13 @@ class TestE2EPipeline:
 
         # n_ppo_epochs=3
         cfg3 = _tiny_config(n_ppo_epochs=3, experiment_name="test_epochs3")
-        trainer3 = load_ppo_trainer(cfg3, device)
+        trainer3, _ = load_ppo_trainer(cfg3, device)
         metrics3 = trainer3.train_step(prompts, gts)
         assert _all_finite(metrics3), f"Non-finite metrics with n_ppo_epochs=3: {metrics3}"
 
         # Verify ppo_update was called 3 times by patching and counting
         cfg_mock = _tiny_config(n_ppo_epochs=3, experiment_name="test_epochs_mock")
-        trainer_mock = load_ppo_trainer(cfg_mock, device)
+        trainer_mock, _ = load_ppo_trainer(cfg_mock, device)
         call_count = 0
         original_ppo_update = trainer_mock.ppo_update
 
@@ -364,7 +364,7 @@ class TestE2EPipeline:
             n_steps=3,
             experiment_name="test_adv_error",
         )
-        trainer = load_ppo_trainer(cfg, device)
+        trainer, _ = load_ppo_trainer(cfg, device)
 
         prompts = data["train_prompts"][:2]
         gts = data["train_gts"][:2]

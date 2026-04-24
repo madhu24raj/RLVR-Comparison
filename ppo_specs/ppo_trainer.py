@@ -51,6 +51,7 @@ from src.rewards import (
     gsm8k_reward,
     extract_answer_from_completion,
     matches_boxed_format,
+    make_reward_fn,
 )
 from eval.metrics import ExperimentLogger
 from eval.metrics import accuracy as compute_accuracy
@@ -727,12 +728,16 @@ def load_ppo_trainer(config: PPOConfig, device: torch.device) -> PPOTrainer:
         for p in reference_model.parameters():
             p.requires_grad_(False)
 
+    reward_fn, diagnostic_fn = make_reward_fn(
+        config, reference_model=reference_model, tokenizer=tokenizer,
+    )
+
     return PPOTrainer(
         config=config,
         model=model,
         tokenizer=tokenizer,
         critic=critic,
-        reward_fn=gsm8k_reward,
+        reward_fn=reward_fn,
         device=device,
         reference_model=reference_model,
-    )
+    ), diagnostic_fn

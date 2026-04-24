@@ -73,7 +73,7 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
 
     # ── Trainer ───────────────────────────────────────────────────────────────
     # Loaded before prompt formatting so we can use the model's chat template (L12).
-    trainer = load_ppo_trainer(config, device)
+    trainer, diagnostic_fn = load_ppo_trainer(config, device)
 
     train_prompts = [
         format_prompt_with_template(ex["question"], trainer.tokenizer) for ex in train_ds
@@ -149,6 +149,10 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
         batch_p  = cycle_batch(train_prompts, step, config.batch_size)
         batch_gt = cycle_batch(train_gts,     step, config.batch_size)
 
+        # Set question context for self-judge reward (no-op for deterministic)
+        if hasattr(trainer.reward_fn, 'set_questions'):
+            trainer.reward_fn.set_questions(batch_p)
+
         metrics = trainer.train_step(batch_p, batch_gt)
         reward_history.append(metrics["mean_reward"])
 
@@ -166,6 +170,17 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
         # ── Periodic evaluation ───────────────────────────────────────────────
         if step % config.eval_every == 0:
             test_acc = trainer.evaluate(test_prompts, test_gts, n_eval=config.eval_size)
+
+            # Dual-track: when using self_judge/combined, evaluate deterministic
+            # accuracy on held-out set to detect reward hacking.
+            diagnostic_test_acc = None
+            if diagnostic_fn is not None:
+                saved_reward_fn = trainer.reward_fn
+                trainer.reward_fn = diagnostic_fn
+                diagnostic_test_acc = trainer.evaluate(
+                    test_prompts, test_gts, n_eval=config.eval_size,
+                )
+                trainer.reward_fn = saved_reward_fn
 
             # (ii) Training stability: variance over the last window
             window = reward_history[-config.eval_every:] if len(reward_history) >= config.eval_every \
@@ -216,6 +231,8 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
                 "parse_success_rate":  metrics["parse_success_rate"],
                 "format_match_rate":   metrics["format_match_rate"],
                 "reward_nonzero_rate": metrics["reward_nonzero_rate"],
+                "reward_mode": config.reward_mode,
+                "diagnostic_test_accuracy": diagnostic_test_acc,
             }
             if adv_error is not None:
                 log_entry["advantage_error"] = adv_error       # (iv)
@@ -272,6 +289,15 @@ if __name__ == "__main__":
         "--resume-from", type=str, default="",
         help="Path to checkpoint dir, or 'auto' for latest",
     )
+    parser.add_argument(
+        "--reward-mode", type=str, default=None,
+        choices=["deterministic", "self_judge", "combined"],
+        help="Reward mode: deterministic (binary), self_judge (log-likelihood), combined",
+    )
+    parser.add_argument(
+        "--self-judge-weight", type=float, default=None,
+        help="Weight for self_judge in combined mode (0-1)",
+    )
     args = parser.parse_args()
 
     cfg = local_test_config() if args.local_test else e2_7_config(seed=args.seed)
@@ -280,5 +306,11 @@ if __name__ == "__main__":
         cfg.checkpoint_every = args.checkpoint_every
     if args.resume_from:
         cfg.resume_from = args.resume_from
+    if args.reward_mode:
+        cfg.reward_mode = args.reward_mode
+        if cfg.reward_mode != "deterministic" and cfg.reference_kl_coeff == 0:
+            cfg.reference_kl_coeff = 0.01  # auto-enable reference model
+    if args.self_judge_weight is not None:
+        cfg.self_judge_weight = args.self_judge_weight
 
     run_e2_7(cfg, compute_mc=not args.no_mc)

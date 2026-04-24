@@ -129,7 +129,8 @@ def fp32_trainer():
     """Load a trainer with float32 on CPU. Reused across the module."""
     cfg = _tiny_config(torch_dtype="float32")
     device = DEVICE
-    return load_ppo_trainer(cfg, device)
+    trainer, _ = load_ppo_trainer(cfg, device)
+    return trainer
 
 
 @pytest.fixture(scope="module")
@@ -139,7 +140,8 @@ def gpu_bf16_trainer():
         pytest.skip("CUDA not available")
     cfg = _tiny_config(torch_dtype="bfloat16")
     device = torch.device("cuda")
-    return load_ppo_trainer(cfg, device)
+    trainer, _ = load_ppo_trainer(cfg, device)
+    return trainer
 
 
 @pytest.fixture(scope="module")
@@ -149,7 +151,8 @@ def gpu_auto_trainer():
         pytest.skip("CUDA not available")
     cfg = _tiny_config(torch_dtype="auto")
     device = torch.device("cuda")
-    return load_ppo_trainer(cfg, device)
+    trainer, _ = load_ppo_trainer(cfg, device)
+    return trainer
 
 
 @pytest.fixture(scope="module")
@@ -157,7 +160,8 @@ def checkpointing_trainer():
     """Load a trainer with gradient checkpointing enabled on CPU."""
     cfg = _tiny_config(torch_dtype="float32", gradient_checkpointing=True)
     device = DEVICE
-    return load_ppo_trainer(cfg, device)
+    trainer, _ = load_ppo_trainer(cfg, device)
+    return trainer
 
 
 # ===========================================================================
@@ -173,7 +177,7 @@ class TestAutoDtypeSelection:
         # fp32_trainer uses explicit float32; test the auto logic directly
         cfg = _tiny_config(torch_dtype="auto")
         device = DEVICE
-        trainer = load_ppo_trainer(cfg, device)
+        trainer, _ = load_ppo_trainer(cfg, device)
         param = next(trainer.model.parameters())
         assert param.dtype == torch.float32, (
             f"auto on CPU should be float32, got {param.dtype}"
