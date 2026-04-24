@@ -54,6 +54,11 @@ class PPOConfig:
     grad_clip_norm: float = 1.0     # max gradient norm for policy and critic
     log_ratio_clip: float = 20.0    # clamp log-ratio before exp() to prevent overflow
 
+    # ── Reward model settings ────────────────────────────────────────────────
+    reward_mode: str = "deterministic"   # "deterministic" | "self_judge" | "combined"
+    self_judge_weight: float = 0.5       # weight for self_judge in combined mode (0-1)
+    self_judge_normalize: bool = True    # sigmoid-scale log-probs to [0, 1]
+
     # ── Rollout settings ─────────────────────────────────────────────────────
     # E2.7 spec: PPO uses 1 rollout per prompt (plus critic).
     n_rollouts_per_prompt: int = 1

@@ -648,3 +648,95 @@ class TestSelfJudgeRewardModel:
         assert math.isfinite(score_a)
         assert math.isfinite(score_b)
         assert score_a != score_b
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. Reward Mode Config  (ppo_specs/config.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestRewardModeConfig:
+    def test_default_reward_mode_is_deterministic(self):
+        from ppo_specs.config import PPOConfig
+        cfg = PPOConfig()
+        assert cfg.reward_mode == "deterministic"
+
+    def test_self_judge_weight_default(self):
+        from ppo_specs.config import PPOConfig
+        cfg = PPOConfig()
+        assert cfg.self_judge_weight == 0.5
+
+    def test_reward_mode_accepts_valid_values(self):
+        from ppo_specs.config import PPOConfig
+        for mode in ("deterministic", "self_judge", "combined"):
+            cfg = PPOConfig(reward_mode=mode)
+            assert cfg.reward_mode == mode
+
+    def test_self_judge_normalize_default_true(self):
+        from ppo_specs.config import PPOConfig
+        cfg = PPOConfig()
+        assert cfg.self_judge_normalize is True
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 8. make_reward_fn Factory  (src/rewards.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestMakeRewardFn:
+    def test_deterministic_mode_returns_gsm8k_reward(self):
+        from src.rewards import make_reward_fn
+        from ppo_specs.config import PPOConfig
+        cfg = PPOConfig(reward_mode="deterministic")
+        reward_fn, diagnostic_fn = make_reward_fn(cfg)
+        assert reward_fn("#### 42", "42") == 1.0
+        assert reward_fn("#### 99", "42") == 0.0
+
+    def test_deterministic_mode_diagnostic_is_none(self):
+        from src.rewards import make_reward_fn
+        from ppo_specs.config import PPOConfig
+        cfg = PPOConfig(reward_mode="deterministic")
+        reward_fn, diagnostic_fn = make_reward_fn(cfg)
+        assert diagnostic_fn is None
+
+    def test_self_judge_mode_requires_model(self):
+        from src.rewards import make_reward_fn
+        from ppo_specs.config import PPOConfig
+        cfg = PPOConfig(reward_mode="self_judge")
+        with pytest.raises(ValueError, match="reference_model"):
+            make_reward_fn(cfg)
+
+    def test_self_judge_mode_returns_callable(self):
+        from src.rewards import make_reward_fn
+        from ppo_specs.config import PPOConfig
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        model_name = "sshleifer/tiny-gpt2"
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model.eval()
+        cfg = PPOConfig(reward_mode="self_judge")
+        reward_fn, diagnostic_fn = make_reward_fn(cfg, reference_model=model, tokenizer=tokenizer)
+        assert callable(reward_fn)
+        assert diagnostic_fn is not None
+        assert diagnostic_fn("#### 42", "42") == 1.0
+
+    def test_combined_mode_blends_rewards(self):
+        from src.rewards import make_reward_fn
+        from ppo_specs.config import PPOConfig
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        model_name = "sshleifer/tiny-gpt2"
+        model = AutoModelForCausalLM.from_pretrained(model_name)
+        tokenizer = AutoTokenizer.from_pretrained(model_name)
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+        model.eval()
+        cfg = PPOConfig(reward_mode="combined", self_judge_weight=0.5)
+        reward_fn, diagnostic_fn = make_reward_fn(cfg, reference_model=model, tokenizer=tokenizer)
+        import math
+        # Need to set questions before calling
+        reward_fn.set_questions(["What is 2+2?"])
+        score = reward_fn("#### 4", "4")
+        assert isinstance(score, float)
+        assert math.isfinite(score)
