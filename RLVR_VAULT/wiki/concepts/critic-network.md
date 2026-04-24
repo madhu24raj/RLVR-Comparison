@@ -1,7 +1,7 @@
 ---
 type: concept
 tags: [critic-network, value-network, ppo, advantage-estimation, exp-2.8]
-sources: []
+sources: [arora2026-rlvr-foundations]
 updated: 2026-04-15
 ---
 
@@ -31,10 +31,20 @@ Key metric in exp 2.8 crossover plot: critic error vs accuracy.
 
 Central variable in exp 2.8. Hypothesis: larger critics reduce advantage estimation error, improving sample efficiency — but compute cost may not justify the gain vs GRPO's zero-cost baseline.
 
+**Theoretical framing** ([[arora2026-rlvr-foundations]]):
+- Critic approximation error `ε_V = sup_s |V_φ(s) − V^π(s)|` determines an **irreducible** PPO advantage bias of `ε_V/(1−γ)`. This bias does not decrease with more samples — it is set by the critic function class.
+- Statistical cost: `d_V` function-class complexity term in `n_PPO = O((d_V + C_π)/ε²)`.
+- The **PPO↔GRPO crossover** (Theorem 2.5 prediction):
+
+      ε*_V  ≈  (1 − γ) · √(σ*²(1 − 1/G) − σ*²_A)
+
+  For critic error below `ε*_V`, PPO beats GRPO; above it, GRPO wins. Exp 2.8 tests this crossover directly across the {none, small, medium, large} × {G=4,8,16} grid.
+- For long reasoning chains `(1−γ)^{-1} ≫ 1` with binary sparse rewards, the `ε_V/(1−γ)` bias term dominates and the crossover pushes toward GRPO regardless of critic size.
+
 ## Connections
 - [[ppo]] — requires critic for GAE
 - [[advantage-estimation]] — uses critic output
 - [[grpo]] — critic-free baseline for comparison
 
 ## Key Sources
-_(populated on paper ingest)_
+- [[arora2026-rlvr-foundations]] — derives the `ε_V/(1−γ)` bias floor and the crossover formula `ε*_V ≈ (1−γ)·√(σ*²(1 − 1/G) − σ*²_A)` tested in exp 2.8

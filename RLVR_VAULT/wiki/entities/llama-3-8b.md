@@ -1,7 +1,7 @@
 ---
 type: entity
 tags: [llama, meta, base-model, transformer]
-sources: []
+sources: [arora2026-rlvr-foundations]
 updated: 2026-04-15
 ---
 
@@ -24,4 +24,4 @@ Base model for PPO, GRPO, and DPO fine-tuning. In PPO: also used as backbone for
 - [[critic-network]] — PPO adds a value head to this model
 
 ## Key Sources
-_(populated on paper ingest)_
+- [[arora2026-rlvr-foundations]] — specifies LLaMA-3 8B as the common backbone for all methods in E2.7/2.8/2.9

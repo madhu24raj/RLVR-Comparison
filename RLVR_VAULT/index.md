@@ -40,6 +40,7 @@ Search wiki: `./search.sh "query" [subdir]`
 ## Sources
 
 - [[project-notes-initial]] — Initial project planning notes: experiment scope (2.7/2.8/2.9), methods, benchmarks, task ownership
+- [[arora2026-rlvr-foundations]] — Project brief (Arora, Feb 2026): unified KL-regularized framing, PPO bias floor `ε_V/(1−γ)`, GRPO variance theorem `σ*²(1−1/G)`, GRPO↔DPO gradient equivalence at G=2, defines E2.7/2.8/2.9
 
 ---
 

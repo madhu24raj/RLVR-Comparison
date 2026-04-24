@@ -1,7 +1,7 @@
 ---
 type: concept
 tags: [rlvr, reward-signal, verifiable-reward, rl]
-sources: []
+sources: [arora2026-rlvr-foundations]
 updated: 2026-04-15
 ---
 
@@ -22,10 +22,12 @@ No reward model training required. Reward hacking via reward model overoptimizat
 
 Unifying reward framework for all three methods. PPO and GRPO use verifiable rewards online (per rollout). DPO uses them offline to construct preference pairs.
 
+**Why RLVR is the regime where GRPO shines** ([[arora2026-rlvr-foundations]], Remark 2.4): verifiable tasks have (i) binary sparse rewards, which make the PPO critic hard to train (large `ε_V`), amplifying the `ε_V/(1−γ)` bias floor; (ii) no natural paired-preference format, forcing DPO to synthesize pairs from scalar rewards and lose its offline-data-efficiency argument. GRPO's group-relative baseline handles both issues directly: no critic to train, no pair construction needed, and the `O(1/√G)` baseline concentration gives a clean accuracy knob.
+
 ## Connections
 - [[verifiable-reward]] — the reward computation mechanism
 - [[ppo]], [[grpo]], [[dpo]] — all use RLVR as reward signal
 - [[gsm8k]], [[humaneval]] — the two verifiable benchmarks
 
 ## Key Sources
-_(populated on paper ingest)_
+- [[arora2026-rlvr-foundations]] — frames all three methods as estimators of the same KL-regularized optimum and explains why RLVR's binary sparse rewards favor GRPO

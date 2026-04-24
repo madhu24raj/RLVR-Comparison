@@ -1,7 +1,7 @@
 ---
 type: concept
 tags: [preference-pairs, dpo, synthetic-data, rlvr]
-sources: []
+sources: [arora2026-rlvr-foundations]
 updated: 2026-04-15
 ---
 
@@ -32,4 +32,4 @@ Built as a standalone pipeline. Used to construct the DPO training dataset for e
 - [[rlvr]] — reward source
 
 ## Key Sources
-_(populated on paper ingest)_
+- [[arora2026-rlvr-foundations]] — argues that on verifiable tasks, synthetic pair construction is an avoidable detour: GRPO consumes the scalar rewards directly without losing the DPO↔GRPO gradient equivalence

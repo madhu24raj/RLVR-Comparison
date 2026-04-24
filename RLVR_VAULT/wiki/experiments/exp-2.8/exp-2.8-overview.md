@@ -1,7 +1,7 @@
 ---
 type: experiment
 tags: [exp-2.8, ppo, grpo, critic-sweep, advantage-estimation]
-sources: []
+sources: [arora2026-rlvr-foundations]
 updated: 2026-04-15
 ---
 
@@ -14,7 +14,19 @@ Determine whether larger critic networks reduce advantage estimation error enoug
 - Methods: PPO with critic sizes {none (=GRPO baseline), small, medium, large}
 - Dataset: [[gsm8k]] (primary)
 - Key output: crossover plot of Monte Carlo advantage error vs accuracy
-- Additional metrics: compute cost, convergence speed
+- **GRPO group sizes:** `G ∈ {4, 8, 16}` (full {critic-size × G} grid)
+- Additional metrics: compute cost, convergence speed, critic approximation error `ε_V` on a held-out value estimation task, PPO advantage bias vs MC ground truth
+
+## Theoretical Prediction ([[arora2026-rlvr-foundations]], Theorem 2.5 + §3.2)
+
+The PPO↔GRPO crossover in critic approximation error:
+
+    ε*_V  ≈  (1 − γ) · √( σ*²(1 − 1/G) − σ*²_A )
+
+- For critic error **below** `ε*_V`: PPO wins (low variance dominates).
+- For critic error **above** `ε*_V`: GRPO wins (bias floor dominates).
+
+The sweep should trace out an error-vs-accuracy curve with PPO improving as critic size grows until the crossover, then flattening against the GRPO line. Verify the measured `ε*_V` matches the predicted value for each G.
 
 ## Critic Size Definitions
 

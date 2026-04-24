@@ -1,7 +1,7 @@
 ---
 type: entity
 tags: [humaneval, benchmark, code, verifiable-reward]
-sources: []
+sources: [arora2026-rlvr-foundations]
 updated: 2026-04-15
 ---
 
@@ -25,4 +25,4 @@ Secondary code benchmark. Used in exp 2.7 (head-to-head across PPO/GRPO/DPO). Ve
 - [[ppo]], [[grpo]], [[dpo]] — evaluated here in exp 2.7
 
 ## Key Sources
-_(populated on paper ingest)_
+- [[arora2026-rlvr-foundations]] — designates HumanEval as the E2.7 code-benchmark complement to GSM8K; cites Chen et al. 2021

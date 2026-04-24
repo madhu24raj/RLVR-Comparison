@@ -1,7 +1,7 @@
 ---
 type: concept
 tags: [advantage-estimation, gae, critic, ppo, grpo]
-sources: []
+sources: [arora2026-rlvr-foundations]
 updated: 2026-04-15
 ---
 
@@ -22,7 +22,9 @@ Requires trained critic V(s). λ controls bias-variance tradeoff.
 
     A_i = (r_i - mean(r_group)) / std(r_group)
 
-No critic. Higher variance per estimate; unbiased given sufficient group size.
+No critic. See [[grpo]] for the exact variance formula.
+
+> [!warning] "Unbiased given sufficient group size" — clarification from [[arora2026-rlvr-foundations]]. "Bias" in the paper's Theorem 2.5 refers to `E[Â^GRPO_i]` (the mean of the baseline-subtracted estimator), not unbiasedness with respect to the true Q-function advantage `A*(s,a)`. Under population normalization, `E[Â^GRPO_i] = 0` exactly for all G ≥ 2; under empirical normalization it is heuristically `O(1/G)`. The GRPO advantage is **not** an unbiased estimator of the true advantage at any finite G — it is an unbiasedly-centered normalized reward.
 
 **Monte Carlo advantage error (exp 2.8 metric):**
 
@@ -41,4 +43,4 @@ Key comparison axis in exp 2.8: does a larger critic reduce advantage estimation
 - [[rlvr]] — reward signal feeding estimates
 
 ## Key Sources
-_(populated on paper ingest)_
+- [[arora2026-rlvr-foundations]] — formalizes the PPO bias floor `ε_V/(1−γ)` vs GRPO group-baseline variance `σ*²(1 − 1/G)`; specifies the MC advantage error metric used in exp 2.8

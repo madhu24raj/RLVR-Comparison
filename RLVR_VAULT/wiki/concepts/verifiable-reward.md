@@ -1,7 +1,7 @@
 ---
 type: concept
 tags: [verifiable-reward, reward-signal, rlvr, gsm8k, humaneval]
-sources: []
+sources: [arora2026-rlvr-foundations]
 updated: 2026-04-15
 ---
 
@@ -28,4 +28,4 @@ Primary reward signal for PPO and GRPO (online). Used offline to rank rollouts a
 - [[grpo]] — uses group of verifiable rewards to compute advantages
 
 ## Key Sources
-_(populated on paper ingest)_
+- [[arora2026-rlvr-foundations]] — uses the binary-reward `r ∈ {0,1}` setting as the canonical RLVR regime in Theorem 2.5 and the E2.9 label-regime experiment

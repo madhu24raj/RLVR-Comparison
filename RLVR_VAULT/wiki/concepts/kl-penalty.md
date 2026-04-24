@@ -1,7 +1,7 @@
 ---
 type: concept
 tags: [kl-penalty, regularization, policy-constraint, ppo, grpo, dpo]
-sources: []
+sources: [arora2026-rlvr-foundations]
 updated: 2026-04-15
 ---
 
@@ -23,9 +23,15 @@ PPO's ratio clipping is a related proxy that limits per-step policy change witho
 
 Applied explicitly in GRPO objective. PPO uses clipping as a proxy. DPO has an implicit KL term controlled by β. Kept matched across all three methods in exp 2.7 for fair comparison.
 
+**The shared objective** ([[arora2026-rlvr-foundations]], eq. 1): all three methods optimize
+
+    J_β(π) = E_{s~μ}[ E_{a~π}[r(s,a)] − β · KL(π(·|s) ‖ π_ref(·|s)) ]
+
+with unique closed-form maximizer `π*(a|s) ∝ π_ref(a|s) · exp(r(s,a)/β)`. PPO, GRPO, and DPO target the **same** `π*`; they differ only in how they estimate the gradient of `J_β`. For DPO, β is the same coefficient appearing in the `β log(π_θ/π_ref)` implicit-reward reparametrization.
+
 ## Connections
 - [[ppo]], [[grpo]], [[dpo]] — all incorporate KL constraint
 - [[rlvr]] — KL penalty balances reward maximization against reference drift
 
 ## Key Sources
-_(populated on paper ingest)_
+- [[arora2026-rlvr-foundations]] — states the unified `J_β` objective and its closed-form optimum that all three methods target

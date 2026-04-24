@@ -1,7 +1,7 @@
 ---
 type: entity
 tags: [gsm8k, benchmark, math, verifiable-reward]
-sources: []
+sources: [arora2026-rlvr-foundations]
 updated: 2026-04-15
 ---
 
@@ -25,4 +25,4 @@ Primary math benchmark. Used in exps 2.7, 2.8, and 2.9. Verifiable rewards compu
 - [[ppo]], [[grpo]], [[dpo]] — all trained and evaluated here
 
 ## Key Sources
-_(populated on paper ingest)_
+- [[arora2026-rlvr-foundations]] — designates GSM8K as a primary E2.7/E2.8/E2.9 benchmark; cites Cobbe et al. 2021

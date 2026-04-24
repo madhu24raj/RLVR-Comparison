@@ -1,0 +1,219 @@
+{
+  "main": {
+    "id": "fce636a7845a9413",
+    "type": "split",
+    "children": [
+      {
+        "id": "f90d2307025c80c8",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "67b6ea95aa273346",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "wiki/sources/arora2026-rlvr-foundations.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "arora2026-rlvr-foundations"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "752f58cb2c6a3030",
+    "type": "split",
+    "children": [
+      {
+        "id": "cb12f298bab353ef",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "0f97f0a32daf5000",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "c94b286087e178db",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "994467626ef8ad7c",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "b157bafe5fca9fd3",
+    "type": "split",
+    "children": [
+      {
+        "id": "07f20f59732d1055",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "668c444af269943d",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks"
+            }
+          },
+          {
+            "id": "60dc138ef4f00784",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links"
+            }
+          },
+          {
+            "id": "3bd4202f913c5bec",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "a4107da390d889ad",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "c0b455e235496d3b",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "Welcome.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of Welcome"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "67b6ea95aa273346",
+  "lastOpenFiles": [
+    "wiki/concepts/kl-penalty.md",
+    "wiki/concepts/dpo.md",
+    "wiki/experiments/exp-2.7/exp-2.7-overview.md",
+    "wiki/sources/arora2026-rlvr-foundations.md",
+    "wiki/sources/project-notes-initial.md",
+    "wiki/concepts/verifiable-reward.md",
+    "wiki/concepts/preference-pairs.md",
+    "wiki/concepts/ppo.md",
+    "wiki/concepts/grpo.md",
+    "wiki/concepts/critic-network.md",
+    "wiki/concepts/advantage-estimation.md",
+    "raw/notes/project-notes.md",
+    "raw/papers/Project-7-GRPO-vs-DPO-vs-PPO.pdf",
+    "wiki/experiments/exp-2.9/exp-2.9-overview.md",
+    "wiki/experiments/exp-2.8/exp-2.8-overview.md",
+    "wiki/experiments/exp-2.9",
+    "wiki/experiments/exp-2.8",
+    "wiki/experiments/exp-2.7",
+    "wiki/entities/llama-3-8b.md",
+    "wiki/entities/humaneval.md",
+    "wiki/entities/gsm8k.md",
+    "wiki/concepts/rlvr.md",
+    "wiki/sources",
+    "wiki/outputs",
+    "wiki/experiments",
+    "wiki/entities",
+    "wiki/concepts",
+    "wiki",
+    "log.md",
+    "index.md",
+    "CLAUDE.md",
+    "Welcome.md"
+  ]
+}
