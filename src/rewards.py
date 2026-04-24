@@ -5,7 +5,11 @@ Parses model completions, extracts the final numerical answer,
 and compares against ground truth. Returns binary reward (0 or 1).
 """
 
+import math
 import re
+from typing import List, Optional
+
+import torch
 
 
 def extract_answer_from_completion(completion: str) -> str:
@@ -122,6 +126,76 @@ def trl_reward_fn(completions: list[str], ground_truth: list[str], **kwargs) -> 
         )
     """
     return batch_reward(completions, ground_truth)
+
+
+class SelfJudgeRewardModel:
+    """Continuous reward signal using a frozen reference model's log-likelihood.
+
+    Scores how likely the reference model considers the completion given the
+    question. Uses mean log-probability of completion tokens as the raw signal,
+    optionally sigmoid-normalized to [0, 1].
+    """
+
+    def __init__(self, model, tokenizer, normalize: bool = True):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.normalize = normalize
+        # Ensure pad token exists for tokenizer
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+    @torch.no_grad()
+    def score(self, question: str, completion: str) -> float:
+        """Score a single question-completion pair.
+
+        Returns the mean log-probability of the completion tokens, optionally
+        sigmoid-normalized to [0, 1]. Empty completions return 0.5 (normalized)
+        or 0.0 (unnormalized).
+        """
+        if not completion:
+            return 0.5 if self.normalize else 0.0
+
+        # Tokenize question and full sequence
+        question_ids = self.tokenizer.encode(question, add_special_tokens=False)
+        full_text = question + completion
+        full_ids = self.tokenizer.encode(full_text, add_special_tokens=False)
+
+        # Number of completion tokens
+        n_completion = len(full_ids) - len(question_ids)
+        if n_completion <= 0:
+            return 0.5 if self.normalize else 0.0
+
+        input_ids = torch.tensor([full_ids], dtype=torch.long, device=next(self.model.parameters()).device)
+        outputs = self.model(input_ids)
+        # logits shape: (1, seq_len, vocab_size)
+        logits = outputs.logits[0]  # (seq_len, vocab_size)
+
+        # Log-probabilities for each next-token prediction
+        log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+
+        # Extract log-probs for the completion tokens only.
+        # Position i predicts token i+1. Completion tokens start at index
+        # len(question_ids) in the full sequence.
+        completion_start = len(question_ids)
+        completion_log_probs = []
+        for i in range(completion_start, len(full_ids)):
+            # logits at position i-1 predict token at position i
+            token_id = full_ids[i]
+            lp = log_probs[i - 1, token_id].item()
+            completion_log_probs.append(lp)
+
+        mean_lp = sum(completion_log_probs) / len(completion_log_probs)
+
+        if self.normalize:
+            # Sigmoid normalization: shifts so typical log-probs (-3 to -1)
+            # map to usable 0.05-0.73 range
+            return 1.0 / (1.0 + math.exp(-(mean_lp + 2.0)))
+        return mean_lp
+
+    @torch.no_grad()
+    def batch_score(self, questions: List[str], completions: List[str]) -> List[float]:
+        """Score a batch of question-completion pairs."""
+        return [self.score(q, c) for q, c in zip(questions, completions)]
 
 
 if __name__ == "__main__":

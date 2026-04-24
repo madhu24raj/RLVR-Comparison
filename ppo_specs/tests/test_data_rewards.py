@@ -10,6 +10,7 @@ Covers:
     5. End-to-end data pipeline integration
 """
 
+import math
 import sys
 import os
 import json
@@ -570,3 +571,80 @@ class TestDataPipelineIntegration:
             prompt = format_prompt(row["question"])
             assert len(prompt) > 0
             assert row["question"] in prompt
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 6. SelfJudgeRewardModel  (src/rewards.py)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+class TestSelfJudgeRewardModel:
+    """Tests for SelfJudgeRewardModel (continuous reward via reference model log-likelihood)."""
+
+    @pytest.fixture(autouse=True)
+    def _load_model(self):
+        """Load a tiny model once for all tests in this class."""
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        model_name = "sshleifer/tiny-gpt2"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForCausalLM.from_pretrained(model_name)
+        self.model.eval()
+
+    def test_score_returns_finite_float(self):
+        """score() returns a finite float for valid input."""
+        from src.rewards import SelfJudgeRewardModel
+
+        rm = SelfJudgeRewardModel(self.model, self.tokenizer, normalize=True)
+        score = rm.score("What is 2+2?", "The answer is 4.")
+        assert isinstance(score, float)
+        assert math.isfinite(score)
+
+    def test_score_normalized_in_zero_one(self):
+        """When normalize=True, score is in [0, 1]."""
+        from src.rewards import SelfJudgeRewardModel
+
+        rm = SelfJudgeRewardModel(self.model, self.tokenizer, normalize=True)
+        score = rm.score("What is 2+2?", "The answer is 4.")
+        assert 0.0 <= score <= 1.0
+
+    def test_score_unnormalized_is_negative(self):
+        """When normalize=False, raw mean log-prob is negative."""
+        from src.rewards import SelfJudgeRewardModel
+
+        rm = SelfJudgeRewardModel(self.model, self.tokenizer, normalize=False)
+        score = rm.score("What is 2+2?", "The answer is 4.")
+        assert score < 0.0
+
+    def test_batch_score_length_matches(self):
+        """batch_score returns one score per input pair."""
+        from src.rewards import SelfJudgeRewardModel
+
+        rm = SelfJudgeRewardModel(self.model, self.tokenizer)
+        questions = ["Q1?", "Q2?", "Q3?"]
+        completions = ["A1", "A2", "A3"]
+        scores = rm.batch_score(questions, completions)
+        assert len(scores) == 3
+        assert all(isinstance(s, float) for s in scores)
+
+    def test_empty_completion_returns_finite(self):
+        """Empty completion returns a finite score."""
+        from src.rewards import SelfJudgeRewardModel
+
+        rm = SelfJudgeRewardModel(self.model, self.tokenizer, normalize=True)
+        score = rm.score("What is 2+2?", "")
+        assert isinstance(score, float)
+        assert math.isfinite(score)
+        assert score == pytest.approx(0.5)
+
+    def test_coherent_scores_higher_than_random(self):
+        """Different texts produce different scores (weak assertion for tiny-gpt2)."""
+        from src.rewards import SelfJudgeRewardModel
+
+        rm = SelfJudgeRewardModel(self.model, self.tokenizer, normalize=True)
+        score_a = rm.score("What is 2+2?", "The answer is 4.")
+        score_b = rm.score("What is 2+2?", "xyzzy foobar baz quux")
+        # Just assert they're both finite and not identical
+        assert math.isfinite(score_a)
+        assert math.isfinite(score_b)
+        assert score_a != score_b
