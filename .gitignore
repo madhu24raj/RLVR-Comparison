@@ -32,8 +32,6 @@ wandb/
 .cache/
 checkpoints/
 .model_cache/
-
-# Claude Code
 CLAUDE.md
 RLVR_VAULT/
 
