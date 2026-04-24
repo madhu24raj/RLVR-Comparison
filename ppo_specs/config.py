@@ -141,6 +141,15 @@ def local_test_config() -> PPOConfig:
     )
 
 
+def local_test_self_judge_config() -> PPOConfig:
+    """Minimal self-judge config for local pipeline verification."""
+    cfg = local_test_config()
+    cfg.reward_mode = "self_judge"
+    cfg.reference_kl_coeff = 0.01
+    cfg.experiment_name = "ppo_local_test_self_judge"
+    return cfg
+
+
 def e2_7_config(seed: int = 42) -> PPOConfig:
     """Config for E2.7 head-to-head on GSM8K (cluster scale)."""
     return PPOConfig(
@@ -164,6 +173,23 @@ def e2_7_config(seed: int = 42) -> PPOConfig:
         seed=seed,
         experiment_name=f"ppo_e2_7_seed{seed}",
     )
+
+
+def e2_7_self_judge_config(seed: int = 42) -> PPOConfig:
+    """Config for E2.7 with self-judge ORM reward (cluster scale)."""
+    cfg = e2_7_config(seed)
+    cfg.reward_mode = "self_judge"
+    cfg.experiment_name = f"ppo_e2_7_self_judge_seed{seed}"
+    return cfg
+
+
+def e2_7_combined_config(seed: int = 42, weight: float = 0.5) -> PPOConfig:
+    """Config for E2.7 with combined (deterministic + self-judge) reward."""
+    cfg = e2_7_config(seed)
+    cfg.reward_mode = "combined"
+    cfg.self_judge_weight = weight
+    cfg.experiment_name = f"ppo_e2_7_combined_w{weight}_seed{seed}"
+    return cfg
 
 
 def e2_8_config(critic_capacity: str = "medium", seed: int = 42) -> PPOConfig:
