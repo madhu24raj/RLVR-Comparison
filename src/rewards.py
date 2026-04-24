@@ -7,7 +7,7 @@ and compares against ground truth. Returns binary reward (0 or 1).
 
 import math
 import re
-from typing import List, Optional
+from typing import List
 
 import torch
 
@@ -193,9 +193,96 @@ class SelfJudgeRewardModel:
         return mean_lp
 
     @torch.no_grad()
-    def batch_score(self, questions: List[str], completions: List[str]) -> List[float]:
+    def batch_score(self, questions: list[str], completions: list[str]) -> list[float]:
         """Score a batch of question-completion pairs."""
         return [self.score(q, c) for q, c in zip(questions, completions)]
+
+
+class _RewardFnWrapper:
+    """Stateful reward function that uses SelfJudgeRewardModel for scoring.
+
+    Tracks an internal index counter that auto-increments on each call.
+    Call set_questions() before each rollout batch to provide question context.
+    """
+
+    def __init__(self, judge: SelfJudgeRewardModel, deterministic_fn=None, weight: float = 1.0):
+        """
+        Args:
+            judge: SelfJudgeRewardModel instance for self-judge scoring.
+            deterministic_fn: If provided, blend deterministic and self-judge scores.
+            weight: Weight for deterministic score in combined mode (0-1).
+                    self_judge gets (1 - weight).
+        """
+        self._judge = judge
+        self._deterministic_fn = deterministic_fn
+        self._weight = weight
+        self._questions: list[str] = []
+        self._idx: int = 0
+
+    def set_questions(self, questions: list[str]) -> None:
+        """Set the question context for the current rollout batch and reset index."""
+        self._questions = questions
+        self._idx = 0
+
+    def __call__(self, completion: str, ground_truth: str) -> float:
+        """Score a completion, indexing into questions for self-judge context."""
+        question = self._questions[self._idx % len(self._questions)]
+        self_judge_score = self._judge.score(question, completion)
+
+        if self._deterministic_fn is not None:
+            det_score = self._deterministic_fn(completion, ground_truth)
+            result = self._weight * det_score + (1.0 - self._weight) * self_judge_score
+        else:
+            result = self_judge_score
+
+        self._idx += 1
+        return float(result)
+
+
+def make_reward_fn(config, reference_model=None, tokenizer=None):
+    """Factory that returns (reward_fn, diagnostic_fn) based on config.reward_mode.
+
+    Modes:
+        "deterministic" -> (gsm8k_reward, None)
+        "self_judge"    -> (_RewardFnWrapper, gsm8k_reward)
+        "combined"      -> (_RewardFnWrapper with blending, gsm8k_reward)
+
+    Args:
+        config: PPOConfig with reward_mode, self_judge_weight, self_judge_normalize.
+        reference_model: Frozen reference model (required for self_judge/combined).
+        tokenizer: Tokenizer for the reference model.
+
+    Returns:
+        (reward_fn, diagnostic_fn) tuple.
+    """
+    mode = config.reward_mode
+
+    if mode == "deterministic":
+        return gsm8k_reward, None
+
+    if reference_model is None:
+        raise ValueError(
+            "reference_model is required for reward_mode "
+            f"'{mode}'. Pass a frozen model."
+        )
+
+    judge = SelfJudgeRewardModel(
+        reference_model, tokenizer, normalize=config.self_judge_normalize
+    )
+
+    if mode == "self_judge":
+        wrapper = _RewardFnWrapper(judge, deterministic_fn=None, weight=0.0)
+        return wrapper, gsm8k_reward
+
+    if mode == "combined":
+        wrapper = _RewardFnWrapper(
+            judge,
+            deterministic_fn=gsm8k_reward,
+            weight=config.self_judge_weight,
+        )
+        return wrapper, gsm8k_reward
+
+    raise ValueError(f"Unknown reward_mode: '{mode}'")
 
 
 if __name__ == "__main__":
