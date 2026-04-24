@@ -210,8 +210,8 @@ class _RewardFnWrapper:
         Args:
             judge: SelfJudgeRewardModel instance for self-judge scoring.
             deterministic_fn: If provided, blend deterministic and self-judge scores.
-            weight: Weight for deterministic score in combined mode (0-1).
-                    self_judge gets (1 - weight).
+            weight: Weight for self-judge score in combined mode (0-1).
+                    deterministic gets (1 - weight).
         """
         self._judge = judge
         self._deterministic_fn = deterministic_fn
@@ -231,7 +231,7 @@ class _RewardFnWrapper:
 
         if self._deterministic_fn is not None:
             det_score = self._deterministic_fn(completion, ground_truth)
-            result = self._weight * det_score + (1.0 - self._weight) * self_judge_score
+            result = (1.0 - self._weight) * det_score + self._weight * self_judge_score
         else:
             result = self_judge_score
 
