@@ -57,8 +57,6 @@ def batched_per_token_log_probs(
     outputs = model(
         input_ids=padded, attention_mask=attention_mask, use_cache=False,
     )
-    logits = outputs.logits.float()  # log_softmax in fp32 for stability
-    log_probs_full = torch.log_softmax(logits, dim=-1)  # [B, max_len, V]
 
     max_resp_len = max(
         max(len(all_full_ids[i]) - prompt_lens[i], 0) for i in range(B)
@@ -70,19 +68,26 @@ def batched_per_token_log_probs(
     per_token = torch.zeros((B, max_resp_len), device=device)
     mask = torch.zeros((B, max_resp_len), device=device)
 
+    # Process one sample at a time to avoid materializing the full
+    # [B, S, V] log_softmax tensor. With Qwen2.5's 151k vocab, the
+    # full tensor is ~4.7 GB in fp32 at batch=16, seq=400 — too large
+    # for a T4 alongside two model copies.
     for i in range(B):
         pl = prompt_lens[i]
         seq_len = len(all_full_ids[i])
         resp_len = seq_len - pl
         if resp_len <= 0:
             continue
-        response_log_probs = log_probs_full[i, pl - 1 : seq_len - 1, :]  # [R, V]
+        # Only compute log_softmax on this sample's response positions
+        response_logits = outputs.logits[i, pl - 1 : seq_len - 1, :].float()  # [R, V]
+        response_log_probs = torch.log_softmax(response_logits, dim=-1)  # [R, V]
         response_ids = padded[i, pl:seq_len]  # [R]
         token_lp = response_log_probs.gather(
             1, response_ids.unsqueeze(-1)
         ).squeeze(-1)  # [R]
         per_token[i, :resp_len] = token_lp
         mask[i, :resp_len] = 1.0
+        del response_logits, response_log_probs  # free immediately
 
     return per_token, mask
 
