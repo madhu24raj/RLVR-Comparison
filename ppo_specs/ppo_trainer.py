@@ -81,6 +81,7 @@ class Rollout:
     # Defaults keep existing positional Rollout(...) construction in tests working.
     parse_success: bool = False       # extract_answer_from_completion(...) returned a value
     format_match_boxed: bool = False  # completion contains \boxed{...}
+    det_reward: float = 0.0          # deterministic gsm8k_reward (always computed for accuracy)
 
 
 @dataclass
@@ -208,6 +209,9 @@ class PPOTrainer:
                 full_ids[prompt_len:], skip_special_tokens=True
             )
             reward = self.reward_fn(completion, ground_truths[i])
+            # Always compute deterministic reward for accuracy reporting,
+            # regardless of training reward mode.
+            det_reward = gsm8k_reward(completion, ground_truths[i])
 
             # Phase-1 diagnostics: is the model producing parseable output?
             # Computed on the same completion string the reward sees, so rates
@@ -225,6 +229,7 @@ class PPOTrainer:
                 prompt_len=prompt_len,
                 parse_success=parse_success,
                 format_match_boxed=format_match_boxed,
+                det_reward=det_reward,
             ))
 
         # Batch compute old log probs
@@ -601,7 +606,7 @@ class PPOTrainer:
             for k in all_metrics[0]
         }
         aggregated["accuracy"] = compute_accuracy(
-            [r.reward for r in batch.rollouts]
+            [r.det_reward for r in batch.rollouts]
         )
         # Phase-1 reward-starvation diagnostics (batch-level rates).
         # reward_nonzero_rate equals accuracy under the current binary reward,
@@ -628,7 +633,12 @@ class PPOTrainer:
         ground_truths: List[str],
         n_eval: int = 50,
     ) -> float:
-        """Batched greedy decoding accuracy on the first n_eval prompts."""
+        """Batched greedy decoding accuracy on the first n_eval prompts.
+
+        Always uses deterministic gsm8k_reward for evaluation regardless
+        of training reward mode — accuracy means "did you get the right
+        answer", not "did the self-judge like your completion".
+        """
         self.model.eval()
         eval_prompts = prompts[:n_eval]
         eval_gts = ground_truths[:n_eval]
@@ -661,7 +671,7 @@ class PPOTrainer:
                 completion = self.tokenizer.decode(
                     out[i][real_start + pl:], skip_special_tokens=True
                 )
-                rewards.append(self.reward_fn(completion, batch_gt[i]))
+                rewards.append(gsm8k_reward(completion, batch_gt[i]))
 
         return compute_accuracy(rewards)
 
