@@ -57,7 +57,7 @@ class PPOConfig:
     # ── Reward model settings ────────────────────────────────────────────────
     reward_mode: str = "deterministic"   # "deterministic" | "self_judge" | "combined"
     self_judge_weight: float = 0.5       # weight for self_judge in combined mode (0-1)
-    self_judge_normalize: bool = True    # sigmoid-scale log-probs to [0, 1]
+    self_judge_normalize: bool = False   # raw log-probs for wider reward range
 
     # ── Rollout settings ─────────────────────────────────────────────────────
     # E2.7 spec: PPO uses 1 rollout per prompt (plus critic).
