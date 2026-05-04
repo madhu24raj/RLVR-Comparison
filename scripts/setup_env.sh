@@ -22,6 +22,7 @@ PYTHON_VERSION="3.11"
 CUDA_VERSION="12.1"
 SKIP_MODELS=false
 DOWNLOAD_LARGE=false
+CPU_ONLY=false
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MODEL_CACHE="${PROJECT_DIR}/.model_cache"
 
@@ -33,6 +34,7 @@ while [[ $# -gt 0 ]]; do
         --cuda)         CUDA_VERSION="$2"; shift 2 ;;
         --skip-models)  SKIP_MODELS=true; shift ;;
         --large-model)  DOWNLOAD_LARGE=true; shift ;;
+        --cpu-only)     CPU_ONLY=true; shift ;;
         --cache-dir)    MODEL_CACHE="$2"; shift 2 ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -68,23 +70,34 @@ fi
 
 echo "  Python: $(python --version)"
 
-# ── Step 2: Install PyTorch with CUDA ────────────────────────────────────────
+# ── Step 2: Install PyTorch (CUDA or CPU) ───────────────────────────────────
 echo ""
-echo "[2/5] Installing PyTorch with CUDA ${CUDA_VERSION}..."
+if [ "${CPU_ONLY}" = "true" ]; then
+    echo "[2/5] Installing PyTorch (CPU-only build)..."
 
-# Map CUDA version to PyTorch index URL
-case "${CUDA_VERSION}" in
-    11.8) TORCH_INDEX="https://download.pytorch.org/whl/cu118" ;;
-    12.1) TORCH_INDEX="https://download.pytorch.org/whl/cu121" ;;
-    12.4) TORCH_INDEX="https://download.pytorch.org/whl/cu124" ;;
-    *)    TORCH_INDEX="https://download.pytorch.org/whl/cu121"
-          echo "  Warning: CUDA ${CUDA_VERSION} not recognized, defaulting to cu121" ;;
-esac
+    # CPU-only build: bypass CUDA version mapping entirely.
+    TORCH_INDEX="https://download.pytorch.org/whl/cpu"
 
-pip install torch torchvision torchaudio --index-url "${TORCH_INDEX}"
+    pip install torch torchvision torchaudio --index-url "${TORCH_INDEX}"
 
-# Verify CUDA
-python -c "
+    # CPU-only verification: just confirm torch imports cleanly.
+    python -c "import torch; print('torch:', torch.__version__)"
+else
+    echo "[2/5] Installing PyTorch with CUDA ${CUDA_VERSION}..."
+
+    # Map CUDA version to PyTorch index URL
+    case "${CUDA_VERSION}" in
+        11.8) TORCH_INDEX="https://download.pytorch.org/whl/cu118" ;;
+        12.1) TORCH_INDEX="https://download.pytorch.org/whl/cu121" ;;
+        12.4) TORCH_INDEX="https://download.pytorch.org/whl/cu124" ;;
+        *)    TORCH_INDEX="https://download.pytorch.org/whl/cu121"
+              echo "  Warning: CUDA ${CUDA_VERSION} not recognized, defaulting to cu121" ;;
+    esac
+
+    pip install torch torchvision torchaudio --index-url "${TORCH_INDEX}"
+
+    # Verify CUDA
+    python -c "
 import torch
 print(f'  PyTorch: {torch.__version__}')
 print(f'  CUDA available: {torch.cuda.is_available()}')
@@ -93,6 +106,7 @@ if torch.cuda.is_available():
     print(f'  GPU count: {torch.cuda.device_count()}')
     print(f'  GPU 0: {torch.cuda.get_device_name(0)}')
 "
+fi
 
 # ── Step 3: Install project dependencies ─────────────────────────────────────
 echo ""
@@ -189,3 +203,14 @@ echo "  Submit to SLURM:"
 echo "    sbatch scripts/slurm_e2_7.sh"
 echo "    sbatch --export=ALL,SLURM_MODE=parallel --array=0-3 scripts/slurm_e2_8.sh"
 echo ""
+
+if [ "${CPU_ONLY}" = "true" ]; then
+    echo "============================================="
+    echo "  CPU-only mode: smoke test recipe"
+    echo "============================================="
+    echo ""
+    echo "Verify the setup with:"
+    echo "    accelerate launch --config_file configs/accelerate_cpu.yaml \\"
+    echo "        ppo_specs/run_e2_7.py --local-test --no-mc"
+    echo ""
+fi

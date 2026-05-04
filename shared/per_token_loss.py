@@ -12,6 +12,7 @@ GRPOTrainer can import them without coupling to each other.
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 from typing import List, Optional, Tuple
 
 from transformers import AutoModelForCausalLM
@@ -78,16 +79,21 @@ def batched_per_token_log_probs(
         resp_len = seq_len - pl
         if resp_len <= 0:
             continue
-        # Only compute log_softmax on this sample's response positions
-        response_logits = outputs.logits[i, pl - 1 : seq_len - 1, :].float()  # [R, V]
-        response_log_probs = torch.log_softmax(response_logits, dim=-1)  # [R, V]
-        response_ids = padded[i, pl:seq_len]  # [R]
-        token_lp = response_log_probs.gather(
-            1, response_ids.unsqueeze(-1)
-        ).squeeze(-1)  # [R]
+        # Fused log_softmax + gather via cross_entropy (P14):
+        # cross_entropy(reduction='none') computes -log p(target) per
+        # position in a single fused CUDA kernel, without materializing
+        # the [R, V] log_softmax tensor (~196 MB at 8B per sample under
+        # K=4 grad ≈ ~3 GB transient peak). Negate to recover log p(target).
+        # The .float() upcast on the bf16 logits preserves fp32 numerics
+        # equivalent to log_softmax(dtype=torch.float32) followed by
+        # gather, with one less HBM roundtrip.
+        slice_logits = outputs.logits[i, pl - 1 : seq_len - 1, :]  # [R, V]
+        target_ids = padded[i, pl:seq_len]  # [R]
+        token_lp = -F.cross_entropy(
+            slice_logits.float(), target_ids, reduction="none",
+        )  # [R]
         per_token[i, :resp_len] = token_lp
         mask[i, :resp_len] = 1.0
-        del response_logits, response_log_probs  # free immediately
 
     return per_token, mask
 

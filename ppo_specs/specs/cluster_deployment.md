@@ -52,8 +52,12 @@ Based on **batched generation** (P1 fixed). Previous per-sample estimates were
 | E2.8 sweep (4 caps) | 0.5B | 1x A100 | 4x150 | ~6-10 hours |
 | E2.8 single capacity | 8B | 4x A100 | 150 | ~6-8 hours |
 
-**Note:** P1 (batched generation) is now fixed. The remaining bottleneck for
-multi-GPU scaling is P7 (accelerate integration).
+**Note:** P1 (batched generation) and P7 (Accelerate integration) are both
+now fixed. Multi-GPU DDP runs end-to-end via `accelerate launch`. See
+[ddp_cpu_gpu_migration.md](ddp_cpu_gpu_migration.md) for the design and
+[integration_beads.md](integration_beads.md) for the Phase 2 work that landed
+the trainer/run-script/checkpoint refactor. FSDP and DeepSpeed remain TBD;
+see [distributed.md §4](distributed.md#4-deepspeed-zero-integration).
 
 ### CPU and memory
 
@@ -144,6 +148,33 @@ can be overridden:
 | `WANDB_MODE` | `offline` | W&B mode (offline/online/disabled) |
 | `WANDB_PROJECT` | `rlvr-comparison` | W&B project name |
 | `LOCAL_TEST` | `false` | Set `true` for smoke test |
+| `DEVICE_MODE` | `gpu` | `cpu` or `gpu`. CPU mode picks `accelerate_cpu.yaml` (gloo MULTI_CPU), skips `module load cuda`, skips NCCL exports. |
+| `NUM_PROCESSES` | `4` | accelerate `--num_processes` (only consulted under CPU mode and as the gloo worker count) |
+| `CLUSTER_8B` | `0` | Set `1` to auto-engage the 8B mitigation stack (`--gradient-checkpointing --optimizer-8bit --optimizer-fused --reference-quant int8 --length-bucketed-generation`). Auto-engaged when `MODEL_NAME` matches `*8B*`. |
+| `REWARD_MODEL_CAPACITY` | unset (= `none`) | Learned RM tier: `none` / `small` / `large`. Default leaves the deterministic verifier (gsm8k_reward) as the sole reward signal — the project baseline. |
+| `REWARD_MODEL_NAME` | unset | HF hub id or local path of the learned RM checkpoint (required when `REWARD_MODEL_CAPACITY` ≠ `none`). |
+| `REWARD_BLEND_ALPHA` | `1.0` | Convex blend `alpha * RM + (1-alpha) * gsm8k_reward`. `1.0` = RM only; `0.0` = verifier only. |
+| `REWARD_MODEL_REUSE_REFERENCE` | unset (= `false`) | Set `true` to reuse the KL-anchor reference model as the RM base. Saves ~16 GB at 8B; requires `reference_kl_coeff > 0`. |
+
+### Single-node multi-process CPU smoke (DEVICE_MODE=cpu)
+
+For a CPU-only smoke at the cluster — useful before booking GPU time, since
+distributed bugs (rank-0 gating, `.generate()` hangs under DDP, shard
+divisibility) all surface on the CPU run:
+
+```bash
+sbatch --gres=none --partition=cpu \
+       --export=ALL,DEVICE_MODE=cpu,LOCAL_TEST=true,NUM_PROCESSES=4 \
+       scripts/slurm_e2_7.sh
+```
+
+What to look for in the SLURM stdout:
+- `[RUN] accelerate launch --config_file configs/accelerate_cpu.yaml --num_processes 4 ppo_specs/run_e2_7.py ...`
+- **No** `module load cuda/12.1` invocation.
+- **No** `NCCL_*` env vars in the dump.
+- 5 steps complete; only rank 0 prints; `results/ppo_local_test.json` written exactly once.
+
+This is recipe 7.4 in [ddp_cpu_gpu_migration.md §7](ddp_cpu_gpu_migration.md#7-smoke-test-recipe-runbook).
 
 ---
 
@@ -204,14 +235,13 @@ num_machines: 1
 num_processes: 4
 ```
 
-**Important:** The current PPO trainer code is NOT compatible with FSDP or
-multi-GPU out of the box. The training loop generates completions one-at-a-time
-and maintains per-rollout state that is not distributed. To use FSDP:
-
-1. Wrap the model with `accelerate.prepare(model, optimizer)`
-2. Batch the generation loop
-3. Ensure the critic head is included in the FSDP wrap
-4. Use `accelerator.gather()` for metrics aggregation
+**Status:** Multi-GPU DDP (via `accelerate_multi_gpu.yaml`) is now wired
+end-to-end (Phase 2, 2026-05-04). FSDP and DeepSpeed remain TBD — the FSDP
+yaml below is a starting point but needs trainer-side work for
+`fsdp_use_orig_params` interactions with the no-grad hidden-state extraction
+in `_extract_last_hidden`. Track the FSDP/DeepSpeed work in
+[distributed.md §4](distributed.md#4-deepspeed-zero-integration); not in
+this doc's scope.
 
 ### DeepSpeed ZeRO-2 Config (not yet created)
 
@@ -254,6 +284,10 @@ bash scripts/setup_env.sh --large-model
 
 # Custom environment name and CUDA version
 bash scripts/setup_env.sh --env-name myenv --cuda 12.4
+
+# CPU-only install (useful on CPU-only login or dev nodes — installs the CPU
+# torch wheel, skips CUDA verification). Pairs with DEVICE_MODE=cpu sbatch.
+bash scripts/setup_env.sh --cpu-only
 ```
 
 The script performs five steps:
@@ -573,9 +607,14 @@ handle_preempt() {
 trap handle_preempt SIGUSR1
 ```
 
-This requeues the job but **does not save any state** because the training
-code has no checkpoint support. After implementing checkpointing (Section 7),
-update the handler:
+This requeues the job. The body of the training code now does have
+checkpoint support (see Section 7 — `ppo_specs/checkpoint.py` is wired with
+atomic save/load and a `GracefulExitHandler`), but the SIGUSR1 path in this
+SLURM trap does **not yet forward** the signal cleanly under
+`accelerate launch` (the SIGUSR1 reaches the launcher, not necessarily the
+Python child processes). The handler below is the recommended target shape;
+landing it under Accelerate's process tree is tracked as a follow-up bead
+([ddp_cpu_gpu_migration.md §10](ddp_cpu_gpu_migration.md#10-out-of-scope-follow-ups)).
 
 ```bash
 handle_preempt() {
@@ -634,18 +673,22 @@ Before submitting jobs to the cluster, verify these items:
 - [ ] Set `NCCL_SOCKET_IFNAME` to match your cluster's network interface
 - [ ] Run a smoke test: `sbatch --export=ALL,LOCAL_TEST=true scripts/slurm_e2_7.sh`
 
-### Previously known blockers for 8B models (all resolved)
+### Previously known blockers (all resolved)
 
-These issues from `performance.md` have been **fixed**:
+These issues from `performance.md` and `distributed.md` have been **fixed**:
 
 | ID | Issue | Status |
 |----|-------|--------|
 | P1 | Per-sample generation (no batching) | **Fixed** -- batched generation with left-padding |
 | P6 | No gradient checkpointing | **Fixed** -- `config.gradient_checkpointing = True` |
+| P7 | No Accelerate / multi-GPU integration | **Fixed** (Phase 2, 2026-05-04) -- `PPOTrainer` runs under `Accelerator`; gloo CPU smoke + multi-GPU DDP both wired. See [ddp_cpu_gpu_migration.md](ddp_cpu_gpu_migration.md). |
 | P8 | float32 on GPU | **Fixed** -- `config.torch_dtype = "auto"` (bf16 on CUDA) |
+| RM | No tier-based learned reward model | **Fixed** (Phase 2, 2026-05-04) -- `ppo_specs/reward_model.py` with `none`/`small`/`large` tiers; preserves the "PPO trainer with custom reward functions" baseline. See [reward_model_integration.md](reward_model_integration.md). |
 
-The remaining blocker for multi-GPU training is P7 (accelerate integration), which
-is documented in `specs/distributed.md`.
+Remaining out-of-scope work tracked in
+[distributed.md §4](distributed.md#4-deepspeed-zero-integration) (DeepSpeed
+ZeRO-2/3) and [ddp_cpu_gpu_migration.md §10](ddp_cpu_gpu_migration.md#10-out-of-scope-follow-ups)
+(multi-node rendezvous, FSDP, SIGUSR1-under-accelerate, W&B wiring).
 
 ---
 
@@ -679,7 +722,7 @@ for cap in none small medium large; do
 done
 ```
 
-### Recipe 5: 8B model on 4x A100
+### Recipe 5: 8B model on 4x A100 (deterministic verifier reward)
 
 ```bash
 # E2.7
@@ -692,6 +735,49 @@ sbatch --gres=gpu:4 --mem=128G --time=24:00:00 \
        --export=ALL,SLURM_MODE=multigpu,NUM_GPUS=4,CAPACITY=large,MODEL_NAME=meta-llama/Meta-Llama-3-8B-Instruct \
        scripts/slurm_e2_8.sh
 ```
+
+The 8B mitigation stack (`--gradient-checkpointing --optimizer-8bit
+--optimizer-fused --reference-quant int8 --length-bucketed-generation`)
+auto-engages whenever `MODEL_NAME` matches `*8B*`, so no extra flags needed
+for the OOM-prevention story. Set `CLUSTER_8B=1` to force it on for non-8B
+model names.
+
+### Recipe 6: 8B model with a learned reward model
+
+```bash
+sbatch --gres=gpu:4 --mem=128G --time=24:00:00 \
+       --export=ALL,SLURM_MODE=multigpu,NUM_GPUS=4,\
+MODEL_NAME=meta-llama/Meta-Llama-3-8B-Instruct,\
+REWARD_MODEL_CAPACITY=large,\
+REWARD_MODEL_NAME=<your-RM-checkpoint>,\
+REWARD_MODEL_REUSE_REFERENCE=true \
+       scripts/slurm_e2_7.sh
+```
+
+`REWARD_MODEL_REUSE_REFERENCE=true` shares weights with the KL-anchor
+reference model — saves ~16 GB of GPU memory at 8B. Requires
+`reference_kl_coeff > 0` (default for non-deterministic reward modes). For
+"verifier + RM blend" set `REWARD_BLEND_ALPHA=0.7` (or whatever blend you
+want); leave unset for RM-only.
+
+The conflict-resolution rule from
+[reward_model_integration.md "Interaction with reward_mode"](reward_model_integration.md#interaction-with-reward_mode-orthogonality-contract)
+applies: `REWARD_MODEL_CAPACITY != none` × `reward_mode != deterministic`
+is rejected at load time. Stick with the default reward_mode for learned-RM
+runs and use `REWARD_BLEND_ALPHA` to control the verifier weight.
+
+### Recipe 7: CPU cluster smoke (DDP-correctness gate)
+
+```bash
+sbatch --gres=none --partition=cpu \
+       --export=ALL,DEVICE_MODE=cpu,LOCAL_TEST=true,NUM_PROCESSES=4 \
+       scripts/slurm_e2_7.sh
+```
+
+5-step smoke that exercises the same Accelerate code paths as the GPU run
+(shard / unwrap / gather / wait_for_everyone) but with gloo on CPU.
+Cheaper to schedule than GPU time; catches distributed bugs before they
+cost paid GPU-hours. See [ddp_cpu_gpu_migration.md §7](ddp_cpu_gpu_migration.md#7-smoke-test-recipe-runbook).
 
 ---
 
@@ -748,6 +834,10 @@ accelerate launch --config_file configs/accelerate_deepspeed.yaml \
     ppo_specs/run_e2_7.py --seed 42
 ```
 
-**Note:** Both FSDP and DeepSpeed require modifications to `ppo_trainer.py`
-to wrap models with `accelerator.prepare()`. The current single-sample
-generation loop is incompatible with distributed training.
+**Note:** Multi-GPU DDP (via `accelerate_multi_gpu.yaml`) is wired and
+working as of Phase 2 (2026-05-04). `ppo_trainer.py` calls
+`accelerator.prepare(model, optimizer)` and uses the unwrap pattern for
+`.generate()`. FSDP and DeepSpeed remain TBD — both require additional
+trainer-side work for the no-grad hidden-state extraction and the
+manual-optimizer split between policy and critic; track in
+[distributed.md §4](distributed.md#4-deepspeed-zero-integration).

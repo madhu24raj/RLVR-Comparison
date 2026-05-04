@@ -528,15 +528,15 @@ class TestKLDivergence:
         batch = _make_dummy_rollouts(tokenizer, n=2)
 
         # Recompute old_log_probs from the current model to simulate
-        # the scenario right after rollout generation
-        for r in batch.rollouts:
-            full_ids = torch.tensor(
-                [r.full_ids], dtype=torch.long, device=DEVICE
+        # the scenario right after rollout generation. Use the modern
+        # batched API (legacy _sequence_log_prob was removed).
+        with torch.no_grad():
+            new_lp = trainer._batched_sequence_log_probs(
+                [r.full_ids for r in batch.rollouts],
+                [r.prompt_len for r in batch.rollouts],
             )
-            with torch.no_grad():
-                r.old_log_prob = trainer._sequence_log_prob(
-                    full_ids, r.prompt_len
-                ).item()
+        for i, r in enumerate(batch.rollouts):
+            r.old_log_prob = new_lp[i].item()
 
         metrics = trainer.ppo_update(batch)
         # KL should be very close to zero (same policy for old and new)
@@ -709,29 +709,20 @@ class TestCriticEvaluation:
         assert result[0] == 0.0
 
     def test_critic_value_no_grad_returns_zero_for_none(self, trainer_none):
-        """For critic_capacity='none', _critic_value_no_grad should return 0.0."""
-        enc = trainer_none.tokenizer(
-            "Solve: 2 + 2 =",
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-        ).to(DEVICE)
-
-        value = trainer_none._critic_value_no_grad(enc["input_ids"])
-        assert value == 0.0
+        """For critic_capacity='none', critic value should be 0.0.
+        (Modern API: _batched_critic_values; legacy _critic_value_no_grad removed.)"""
+        values = trainer_none._batched_critic_values(["Solve: 2 + 2 ="])
+        assert values.shape == (1,)
+        assert values[0].item() == 0.0
 
     def test_critic_value_no_grad_finite_for_trainable(self, trainer_medium):
-        """For trainable critics, _critic_value_no_grad should return a finite float."""
-        enc = trainer_medium.tokenizer(
-            "Solve: 2 + 2 =",
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-        ).to(DEVICE)
-
-        value = trainer_medium._critic_value_no_grad(enc["input_ids"])
-        assert isinstance(value, float)
-        assert math.isfinite(value)
+        """For trainable critics, critic value should be a finite float.
+        (Modern API: _batched_critic_values; legacy _critic_value_no_grad removed.)"""
+        values = trainer_medium._batched_critic_values(["Solve: 2 + 2 ="])
+        assert values.shape == (1,)
+        v = values[0].item()
+        assert isinstance(v, float)
+        assert math.isfinite(v)
 
     def test_critic_forward_none_returns_zero_loss(
         self, shared_model_and_tokenizer
@@ -884,123 +875,85 @@ class TestRolloutGeneration:
 
 
 class TestSequenceLogProb:
-    """Tests for _sequence_log_prob computation."""
+    """Tests for sequence-level log-prob computation.
+
+    The legacy `_sequence_log_prob(ids, prompt_len)` method was removed in
+    the 2026-04-09 code review. These tests now exercise the modern
+    `_batched_sequence_log_probs([full_ids], [prompt_len])` API which is
+    semantically equivalent (returns [B] tensor; index [0] for single-sample).
+    """
+
+    def _trainer_with_none_critic(self, model, tokenizer):
+        cfg = _tiny_config(critic_capacity="none")
+        hidden_size = model.config.hidden_size
+        critic = build_critic("none", hidden_size).to(DEVICE)
+        return PPOTrainer(
+            config=cfg, model=model, tokenizer=tokenizer,
+            critic=critic, reward_fn=gsm8k_reward, device=DEVICE,
+        )
 
     def test_log_prob_is_negative_for_valid_sequence(
         self, shared_model_and_tokenizer
     ):
         """The sequence log probability should be negative (log of a value < 1)."""
         model, tokenizer = shared_model_and_tokenizer
-        cfg = _tiny_config(critic_capacity="none")
-        hidden_size = model.config.hidden_size
-        critic = build_critic("none", hidden_size).to(DEVICE)
-
-        trainer = PPOTrainer(
-            config=cfg,
-            model=model,
-            tokenizer=tokenizer,
-            critic=critic,
-            reward_fn=gsm8k_reward,
-            device=DEVICE,
-        )
+        trainer = self._trainer_with_none_critic(model, tokenizer)
 
         text = "Solve: 2 + 2 = The answer is 4."
-        ids = tokenizer.encode(text, add_special_tokens=True, return_tensors="pt").to(
-            DEVICE
-        )
-        prompt_len = 5  # first few tokens as "prompt"
+        full_ids = tokenizer.encode(text, add_special_tokens=True)
+        prompt_len = 5
 
         with torch.no_grad():
-            lp = trainer._sequence_log_prob(ids, prompt_len)
+            lp = trainer._batched_sequence_log_probs([full_ids], [prompt_len])
 
-        assert lp.item() < 0.0, (
-            f"Sequence log prob should be negative, got {lp.item()}"
+        assert lp[0].item() < 0.0, (
+            f"Sequence log prob should be negative, got {lp[0].item()}"
         )
 
     def test_log_prob_is_scalar(self, shared_model_and_tokenizer):
-        """_sequence_log_prob should return a scalar (or 1-element tensor)."""
+        """Batched API returns a 1-D [B] tensor; single-sample input → shape [1]."""
         model, tokenizer = shared_model_and_tokenizer
-        cfg = _tiny_config(critic_capacity="none")
-        hidden_size = model.config.hidden_size
-        critic = build_critic("none", hidden_size).to(DEVICE)
-
-        trainer = PPOTrainer(
-            config=cfg,
-            model=model,
-            tokenizer=tokenizer,
-            critic=critic,
-            reward_fn=gsm8k_reward,
-            device=DEVICE,
-        )
+        trainer = self._trainer_with_none_critic(model, tokenizer)
 
         text = "Hello world, this is a test."
-        ids = tokenizer.encode(text, add_special_tokens=True, return_tensors="pt").to(
-            DEVICE
-        )
+        full_ids = tokenizer.encode(text, add_special_tokens=True)
         prompt_len = 3
 
         with torch.no_grad():
-            lp = trainer._sequence_log_prob(ids, prompt_len)
+            lp = trainer._batched_sequence_log_probs([full_ids], [prompt_len])
 
-        assert lp.dim() <= 1, f"Expected scalar or 1-d tensor, got shape {lp.shape}"
-        if lp.dim() == 1:
-            assert lp.shape[0] == 1
+        assert lp.dim() == 1
+        assert lp.shape[0] == 1
 
     def test_log_prob_zero_for_empty_response(self, shared_model_and_tokenizer):
         """When prompt_len == full sequence length (empty response),
-        _sequence_log_prob should return 0.0."""
+        log prob should be 0.0."""
         model, tokenizer = shared_model_and_tokenizer
-        cfg = _tiny_config(critic_capacity="none")
-        hidden_size = model.config.hidden_size
-        critic = build_critic("none", hidden_size).to(DEVICE)
-
-        trainer = PPOTrainer(
-            config=cfg,
-            model=model,
-            tokenizer=tokenizer,
-            critic=critic,
-            reward_fn=gsm8k_reward,
-            device=DEVICE,
-        )
+        trainer = self._trainer_with_none_critic(model, tokenizer)
 
         text = "Hello"
-        ids = tokenizer.encode(text, add_special_tokens=True, return_tensors="pt").to(
-            DEVICE
-        )
-        seq_len = ids.shape[1]
+        full_ids = tokenizer.encode(text, add_special_tokens=True)
+        seq_len = len(full_ids)
 
         with torch.no_grad():
-            lp = trainer._sequence_log_prob(ids, prompt_len=seq_len)
+            lp = trainer._batched_sequence_log_probs([full_ids], [seq_len])
 
-        assert lp.item() == 0.0, (
-            f"Expected 0.0 for empty response, got {lp.item()}"
+        assert lp[0].item() == 0.0, (
+            f"Expected 0.0 for empty response, got {lp[0].item()}"
         )
 
     def test_log_prob_is_finite(self, shared_model_and_tokenizer):
         """The returned log probability should always be a finite number."""
         model, tokenizer = shared_model_and_tokenizer
-        cfg = _tiny_config(critic_capacity="none")
-        hidden_size = model.config.hidden_size
-        critic = build_critic("none", hidden_size).to(DEVICE)
-
-        trainer = PPOTrainer(
-            config=cfg,
-            model=model,
-            tokenizer=tokenizer,
-            critic=critic,
-            reward_fn=gsm8k_reward,
-            device=DEVICE,
-        )
+        trainer = self._trainer_with_none_critic(model, tokenizer)
 
         text = "What is 2 plus 2? The answer is 4."
-        ids = tokenizer.encode(text, add_special_tokens=True, return_tensors="pt").to(
-            DEVICE
-        )
+        full_ids = tokenizer.encode(text, add_special_tokens=True)
         prompt_len = 4
 
         with torch.no_grad():
-            lp = trainer._sequence_log_prob(ids, prompt_len)
+            lp = trainer._batched_sequence_log_probs([full_ids], [prompt_len])
 
-        assert math.isfinite(lp.item()), (
-            f"Log prob should be finite, got {lp.item()}"
+        assert math.isfinite(lp[0].item()), (
+            f"Log prob should be finite, got {lp[0].item()}"
         )

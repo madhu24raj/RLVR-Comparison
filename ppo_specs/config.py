@@ -7,6 +7,7 @@ Swap model_name to meta-llama/Meta-Llama-3-8B-Instruct on the cluster.
 
 from dataclasses import dataclass, field
 import dataclasses
+from typing import Optional
 
 
 @dataclass
@@ -59,6 +60,16 @@ class PPOConfig:
     self_judge_weight: float = 0.5       # weight for self_judge in combined mode (0-1)
     self_judge_normalize: bool = True    # sigmoid-scale log-probs to [0, 1]
 
+    # ── Learned reward model (additive on top of reward_mode) ───────────────
+    # See ppo_specs/specs/reward_model_integration.md. Defaults reproduce
+    # today's behavior bit-identically (capacity="none", alpha=1.0).
+    reward_model_capacity: str = "none"          # "none" | "small" | "large"
+    reward_model_name: Optional[str] = None      # HF hub id or local path; required if capacity != "none"
+    reward_model_dtype: str = "auto"             # "auto" | "bfloat16" | "float32"
+    reward_model_reuse_reference: bool = False   # share weights with the frozen reference model
+    reward_blend_alpha: float = 1.0              # final = alpha * rm + (1 - alpha) * gsm8k_reward
+    reward_score_activation: str = "sigmoid"     # "sigmoid" | "tanh" | "none"
+
     # ── Rollout settings ─────────────────────────────────────────────────────
     # E2.7 spec: PPO uses 1 rollout per prompt (plus critic).
     n_rollouts_per_prompt: int = 1
@@ -104,6 +115,22 @@ class PPOConfig:
     # ── Dtype and Memory ────────────────────────────────────────────────────
     torch_dtype: str = "auto"           # "auto" | "float32" | "bfloat16" — auto = bf16 on GPU, fp32 on CPU
     gradient_checkpointing: bool = False # enable gradient checkpointing (required for 8B+ models)
+
+    # ── Memory optimizations (cluster scale) ────────────────────────────────
+    # 8-bit AdamW (bitsandbytes). Saves ~48 GB at 8B. <0.5% accuracy loss.
+    # Falls back to torch.optim.AdamW if bitsandbytes is not installed.
+    optimizer_8bit: bool = False
+    # Use torch.optim.AdamW(fused=True) on CUDA. Saves ~16 GB transient
+    # at 8B during .step() vs the default foreach=True path.
+    optimizer_fused: bool = False
+    # Quantize the FROZEN reference model to save memory. Reference is
+    # never trained so quantization does not affect gradient quality.
+    # Values: "none" (bf16/fp32 default), "int8" (bnb LLM.int8), "nf4" (bnb 4-bit).
+    reference_quant: str = "none"
+    # Length-bucketed generation. Sort prompts by length, generate per
+    # bucket. Reduces pad-waste by ~40%. Bucket size in samples.
+    length_bucketed_generation: bool = False
+    generation_bucket_size: int = 4
 
     # ── Checkpointing ───────────────────────────────────────────────────────
     checkpoint_every: int = 20          # save checkpoint every N steps (0 = disabled)

@@ -32,8 +32,41 @@ def save_checkpoint(
     logger,             # ExperimentLogger
     checkpoint_dir: str,
     keep_checkpoints: int = 3,
+    accelerator=None,   # Optional Accelerator for DDP unwrapping
 ) -> str:
-    """Save a complete training checkpoint atomically."""
+    """Save a complete training checkpoint atomically.
+
+    When ``accelerator`` is provided, models are unwrapped via
+    ``accelerator.unwrap_model(...)`` before serialization so the saved
+    state_dict has clean (un-prefixed) keys that load cleanly into either
+    DDP-wrapped or unwrapped trainers. Without unwrapping, a DDP-wrapped
+    module's ``state_dict()`` returns keys prefixed with ``"module."``,
+    which a plain (unwrapped) trainer cannot ``load_state_dict`` directly.
+
+    Backward compatibility: when ``accelerator`` is ``None`` (the default),
+    behavior is identical to the pre-DDP code path — ``trainer.model`` and
+    ``trainer.critic`` are serialized as-is.
+
+    Rank-0 gating contract (caller responsibility):
+        This function does NOT internally check ``accelerator.is_main_process``.
+        Gating writes inside the function would deadlock multi-proc runs:
+        non-rank-0 processes would early-return before reaching the next
+        collective barrier while rank 0 is still writing. Callers in DDP
+        runs MUST gate the call themselves and place a barrier before it::
+
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                save_checkpoint(trainer, ..., accelerator=accelerator)
+
+        The optimizer state_dict is already correct under DDP (Accelerate-
+        prepared optimizers expose the underlying optimizer's state_dict
+        directly), so optimizer serialization needs no special handling.
+    """
+    def _unwrap(module):
+        if accelerator is not None:
+            return accelerator.unwrap_model(module)
+        return module
+
     ckpt_name = f"checkpoint_step_{step:06d}"
     ckpt_path = Path(checkpoint_dir) / ckpt_name
     tmp_path = Path(checkpoint_dir) / f".tmp_{ckpt_name}"
@@ -42,13 +75,13 @@ def save_checkpoint(
         shutil.rmtree(tmp_path)
     tmp_path.mkdir(parents=True, exist_ok=True)
 
-    # Model weights
+    # Model weights (unwrap DDP if needed so saved keys have no 'module.' prefix)
     model_dir = tmp_path / "model"
-    trainer.model.save_pretrained(str(model_dir))
+    _unwrap(trainer.model).save_pretrained(str(model_dir))
     trainer.tokenizer.save_pretrained(str(model_dir))
 
-    # Critic
-    torch.save(trainer.critic.state_dict(), str(tmp_path / "critic.pt"))
+    # Critic (unwrap DDP if needed)
+    torch.save(_unwrap(trainer.critic).state_dict(), str(tmp_path / "critic.pt"))
 
     # Optimizers
     torch.save(trainer.policy_optimizer.state_dict(), str(tmp_path / "policy_optimizer.pt"))
@@ -125,12 +158,16 @@ def load_checkpoint(
         logger_log = json.load(f)
 
     # Optimizer states
-    policy_opt_state = torch.load(str(ckpt / "policy_optimizer.pt"), map_location=device, weights_only=True)
+    # Load optimizer state to CPU first to avoid 2x optimizer-state transient
+    # on GPU during load_state_dict (would cause 96 GB peak for 8B AdamW).
+    # torch's optim.load_state_dict copies tensors to the optimizer's
+    # parameter device per-tensor, so this is correct AND memory-safe.
+    policy_opt_state = torch.load(str(ckpt / "policy_optimizer.pt"), map_location="cpu", weights_only=True)
     critic_opt_path = ckpt / "critic_optimizer.pt"
-    critic_opt_state = torch.load(str(critic_opt_path), map_location=device, weights_only=True) if critic_opt_path.exists() else None
+    critic_opt_state = torch.load(str(critic_opt_path), map_location="cpu", weights_only=True) if critic_opt_path.exists() else None
 
     # Critic state
-    critic_state = torch.load(str(ckpt / "critic.pt"), map_location=device, weights_only=True)
+    critic_state = torch.load(str(ckpt / "critic.pt"), map_location="cpu", weights_only=True)
 
     # RNG states
     rng_states = torch.load(str(ckpt / "rng_states.pt"), map_location="cpu", weights_only=False)
@@ -171,12 +208,26 @@ def restore_rng_states(rng_states: Dict[str, Any]) -> None:
 
 
 def _config_hash(config: PPOConfig) -> str:
+    # Use getattr with defaults so older PPOConfig instances (without these
+    # fields) and pre-existing checkpoints continue to load.
     key_fields = {
         "model_name": config.model_name,
         "critic_capacity": config.critic_capacity,
         "batch_size": config.batch_size,
         "learning_rate": config.learning_rate,
         "clip_epsilon": config.clip_epsilon,
+        "reward_mode": getattr(config, "reward_mode", "deterministic"),
+        "reference_kl_coeff": getattr(config, "reference_kl_coeff", 0.0),
+        "n_ppo_epochs": config.n_ppo_epochs,
+        "kl_coeff": config.kl_coeff,
+        "reward_model_capacity": getattr(config, "reward_model_capacity", "none"),
+        "reward_model_name": getattr(config, "reward_model_name", None),
+        "reward_model_dtype": getattr(config, "reward_model_dtype", "auto"),
+        "reward_model_reuse_reference": getattr(config, "reward_model_reuse_reference", False),
+        "reward_blend_alpha": getattr(config, "reward_blend_alpha", 1.0),
+        "reward_score_activation": getattr(config, "reward_score_activation", "sigmoid"),
+        "optimizer_8bit": getattr(config, "optimizer_8bit", False),
+        "reference_quant": getattr(config, "reference_quant", "none"),
     }
     raw = json.dumps(key_fields, sort_keys=True)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
@@ -212,6 +263,14 @@ class GracefulExitHandler:
         self._original_sigint = signal.getsignal(signal.SIGINT)
         signal.signal(signal.SIGTERM, self._handler)
         signal.signal(signal.SIGINT, self._handler)
+        # SLURM sends SIGUSR1 ahead of preemption (configured via
+        # `#SBATCH --signal=B:SIGUSR1@<seconds>`). Linux only — Windows
+        # does not define SIGUSR1, so we guard with hasattr to keep the
+        # local-dev / Windows test environment working.
+        self._original_sigusr1 = None
+        if hasattr(signal, "SIGUSR1"):
+            self._original_sigusr1 = signal.getsignal(signal.SIGUSR1)
+            signal.signal(signal.SIGUSR1, self._handler)
 
     def _handler(self, signum, frame):
         sig_name = signal.Signals(signum).name
@@ -221,3 +280,5 @@ class GracefulExitHandler:
     def restore_signals(self):
         signal.signal(signal.SIGTERM, self._original_sigterm)
         signal.signal(signal.SIGINT, self._original_sigint)
+        if hasattr(signal, "SIGUSR1") and self._original_sigusr1 is not None:
+            signal.signal(signal.SIGUSR1, self._original_sigusr1)
