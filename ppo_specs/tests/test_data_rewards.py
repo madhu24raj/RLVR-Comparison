@@ -672,10 +672,10 @@ class TestRewardModeConfig:
             cfg = PPOConfig(reward_mode=mode)
             assert cfg.reward_mode == mode
 
-    def test_self_judge_normalize_default_true(self):
+    def test_self_judge_normalize_default_false(self):
         from ppo_specs.config import PPOConfig
         cfg = PPOConfig()
-        assert cfg.self_judge_normalize is True
+        assert cfg.self_judge_normalize is False
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

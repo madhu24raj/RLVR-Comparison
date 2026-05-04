@@ -58,7 +58,7 @@ class PPOConfig:
     # ── Reward model settings ────────────────────────────────────────────────
     reward_mode: str = "deterministic"   # "deterministic" | "self_judge" | "combined"
     self_judge_weight: float = 0.5       # weight for self_judge in combined mode (0-1)
-    self_judge_normalize: bool = True    # sigmoid-scale log-probs to [0, 1]
+    self_judge_normalize: bool = False   # raw log-probs for wider reward range
 
     # ── Learned reward model (additive on top of reward_mode) ───────────────
     # See ppo_specs/specs/reward_model_integration.md. Defaults reproduce

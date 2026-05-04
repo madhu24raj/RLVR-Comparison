@@ -123,6 +123,7 @@ class Rollout:
     # Defaults keep existing positional Rollout(...) construction in tests working.
     parse_success: bool = False       # extract_answer_from_completion(...) returned a value
     format_match_boxed: bool = False  # completion contains \boxed{...}
+    det_reward: float = 0.0          # deterministic gsm8k_reward (always computed for accuracy)
 
 
 @dataclass
@@ -386,10 +387,18 @@ class PPOTrainer:
             full_ids = full_ids_per_sample[i]
             completion = completions[i]
 
+            # Training reward: learned RM fast-path when configured, else
+            # the per-sample self.reward_fn (which routes through
+            # make_reward_fn / reward_mode / SelfJudgeRewardModel as today).
             if rm_scores_list is not None:
                 reward = float(rm_scores_list[i])
             else:
                 reward = self.reward_fn(completion, local_gts[i])
+            # Always compute deterministic verifier reward for accuracy
+            # reporting, regardless of training reward mode or whether a
+            # learned RM is in use. This keeps the accuracy metric binary
+            # and comparable across reward sources.
+            det_reward = gsm8k_reward(completion, local_gts[i])
 
             # Phase-1 diagnostics: is the model producing parseable output?
             # Computed on the same completion string the reward sees, so rates
@@ -407,6 +416,7 @@ class PPOTrainer:
                 prompt_len=prompt_len,
                 parse_success=parse_success,
                 format_match_boxed=format_match_boxed,
+                det_reward=det_reward,
             ))
 
         # Under DDP, gather rollouts so every rank holds the global batch.
@@ -979,20 +989,14 @@ class PPOTrainer:
             k: float(np.mean([m[k] for m in all_metrics]))
             for k in all_metrics[0]
         }
-        # When a learned RM trains the policy, r.reward is a continuous score
-        # and the binary-accuracy metric becomes meaningless. Recompute
-        # accuracy from gsm8k_reward so the reported metric stays comparable
-        # across reward sources. The "none"-tier path (reward_model_scorer is
-        # None) keeps today's bit-identical reduction over r.reward.
-        if self.reward_model_scorer is not None:
-            aggregated["accuracy"] = compute_accuracy(
-                [gsm8k_reward(r.completion, gt)
-                 for r, gt in zip(batch.rollouts, ground_truths)]
-            )
-        else:
-            aggregated["accuracy"] = compute_accuracy(
-                [r.reward for r in batch.rollouts]
-            )
+        # Accuracy always reduces over the per-rollout deterministic verifier
+        # reward (gsm8k_reward), which is populated unconditionally in
+        # generate_rollouts. This keeps the metric binary and comparable
+        # across reward sources — works for the "none" tier, the self-judge
+        # path, the combined path, and the learned-RM path uniformly.
+        aggregated["accuracy"] = compute_accuracy(
+            [r.det_reward for r in batch.rollouts]
+        )
         # Phase-1 reward-starvation diagnostics (batch-level rates).
         # reward_nonzero_rate equals accuracy under the current binary reward,
         # but is tracked as a separate column so it remains meaningful once
@@ -1018,7 +1022,12 @@ class PPOTrainer:
         ground_truths: List[str],
         n_eval: int = 50,
     ) -> float:
-        """Batched greedy decoding accuracy on the first n_eval prompts."""
+        """Batched greedy decoding accuracy on the first n_eval prompts.
+
+        Always uses deterministic gsm8k_reward for evaluation regardless
+        of training reward mode — accuracy means "did you get the right
+        answer", not "did the self-judge like your completion".
+        """
         self.model.eval()
         eval_prompts = prompts[:n_eval]
         eval_gts = ground_truths[:n_eval]
