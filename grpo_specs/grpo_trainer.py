@@ -44,6 +44,8 @@ Usage:
     python grpo_trl.py --seeds 0 1 2 --G 8 --completion_budget 8000
     python grpo_trl.py --label_regime noisy --seeds 0 1 2   # E2.9
     python grpo_trl.py --G 4 --output_dir results/e2_8/grpo_G4  # E2.8 sweep
+
+    # 2.7: grpo_trl.py --G 8 --completion_budget 800 --output_dir results/e2_7/grpo
 """
 
 import argparse
@@ -72,8 +74,8 @@ from eval.metrics import (
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-# TODO: confirm model choice with team (Qwen 2.5 7B vs Llama 3 8B)
-MODEL_NAME    = "meta-llama/Meta-Llama-3-8B-Instruct"
+# TODO: confirm model choice
+MODEL_NAME    = "Qwen/Qwen2.5-0.5B-Instruct"
 LABEL_REGIMES = ("full", "sparse", "noisy")
 
 SPARSE_KEEP_FRACTION = 0.10   # E2.9: keep 10% of reward labels
@@ -271,12 +273,13 @@ def compute_epsilon_v(
 
             # Oracle baseline
             r_oracle = _sample_rewards(G_oracle)
-            mc_adv   = compute_mc_advantage(r_oracle)   # eval/metrics.py
+            mu_oracle = np.mean(r_oracle)
+            mc_adv = [r - mu_oracle for r in r_oracle]   
 
             # GRPO group baseline
             r_grpo   = _sample_rewards(G_grpo)
-            mu, sigma = np.mean(r_grpo), np.std(r_grpo) + eps
-            grpo_adv  = [(r - mu) / sigma for r in r_grpo]
+            mu_grpo  = np.mean(r_grpo)
+            grpo_adv = [r - mu_grpo for r in r_grpo]
 
             k = min(len(grpo_adv), len(mc_adv))
             all_estimated.extend(grpo_adv[:k])
@@ -364,7 +367,7 @@ class GRPOCallback(TrainerCallback):
             print(f"\n[BUDGET] Exhausted at step {state.global_step}. Stopping.")
             control.should_training_stop = True
 
-    def _run_eval(self, model, n_eval: int = 200, batch_size: int = 16) -> float:
+    def _run_eval(self, model, n_eval: int = 100, batch_size: int = 16) -> float:
         """
         Greedy-decode accuracy on the first n_eval examples of eval_dataset.
 
@@ -410,17 +413,16 @@ class GRPOCallback(TrainerCallback):
     def stability_metrics(self, window: int = 50) -> Dict[str, float]:
         """
         Training stability over last `window` steps.
-        Uses reward_variance() from eval/metrics.py.
         """
         r = self._rewards[-window:]
         l = self._losses[-window:]
-        r_var = reward_variance([[v] for v in r])
+        # r_var = r_var = float(np.var(self._rewards[-window:])) # TODO: double-check reward variance (within time stamp or across time stamp)
         return {
             "reward_mean":          float(np.mean(r)) if r else 0.0,
             "reward_std":           float(np.std(r))  if r else 0.0,
             "loss_mean":            float(np.mean(l)) if l else 0.0,
             "loss_std":             float(np.std(l))  if l else 0.0,
-            "reward_variance_mean": float(np.mean(r_var)) if r_var else 0.0,
+            # "reward_variance_mean": float(np.mean(r_var)) if r_var else 0.0,
         }
 
 
@@ -439,8 +441,8 @@ def build_grpo_config(args, seed: int) -> GRPOConfig:
         # Generation
         max_prompt_length=512,
         max_completion_length=512,
-        temperature=0.9,
-        top_p=0.95,
+        temperature=0.7,
+        top_p=0.9,
 
         # PPO-clip
         epsilon=0.2,
@@ -449,7 +451,7 @@ def build_grpo_config(args, seed: int) -> GRPOConfig:
         beta=0.04,
 
         # Optimiser
-        learning_rate=1e-6,
+        learning_rate=1e-5,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=1,
         max_grad_norm=1.0,
@@ -550,7 +552,7 @@ def run_single_seed(args, seed: int, budget: ComputeBudget) -> Dict:
     wall_time = time.time() - t_start
 
     # ── Final accuracy ────────────────────────────────────────────────────────
-    final_acc = callback._run_eval(trainer.model, n_eval=len(test_hf))
+    final_acc = callback._run_eval(trainer.model, n_eval=100)
     print(f"\n  Final accuracy: {final_acc:.4f}")
 
     # ── εV — advantage estimation error ──────────────────────────────────────
