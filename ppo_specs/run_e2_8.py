@@ -58,6 +58,7 @@ from ppo_specs.advantage import (
     critic_approximation_error,
 )
 from ppo_specs.utils import cycle_batch
+from ppo_specs.checkpoint import save_checkpoint
 
 
 # ── DDP detection ─────────────────────────────────────────────────────────────
@@ -110,6 +111,9 @@ def run_one_capacity(
         cfg, accelerator if accelerator is not None else device
     )
     logger  = ExperimentLogger(cfg.experiment_name, cfg.output_dir)
+    # Per-capacity checkpoint dir — keeps the four sweep runs separate on disk
+    # and avoids the small/medium/large checkpoints stomping each other.
+    ckpt_dir = f"{cfg.checkpoint_dir}/{cfg.experiment_name}"
 
     accuracy_curve: list[tuple[int, float]] = []
     ev_samples:     list[float] = []   # critic error εV per eval step
@@ -192,12 +196,36 @@ def run_one_capacity(
                 f"| kl={metrics['kl_divergence']:.4f}"
             )
 
+        # ── Periodic checkpoint save ─────────────────────────────────────
+        # Mirrors the run_e2_7 pattern: barrier-then-rank-0 write. E2.8 does
+        # not yet support resume (--resume-from is accepted as a no-op for
+        # SLURM compatibility), so this is purely a "produce model output
+        # for downstream evaluation" save, not a fault-tolerance save.
+        if cfg.checkpoint_every > 0 and (step + 1) % cfg.checkpoint_every == 0:
+            _wait()
+            if _is_main():
+                save_checkpoint(
+                    trainer, step, cfg, logger, ckpt_dir,
+                    cfg.keep_checkpoints, accelerator=accelerator,
+                )
+
     if _is_main():
         logger.save()
 
     final_acc  = trainer.evaluate(test_prompts, test_gts, n_eval=cfg.final_eval_size)
     mean_ev    = float(np.nanmean(ev_samples))   if ev_samples   else float("nan")
     mean_bias  = float(np.nanmean(bias_samples)) if bias_samples else float("nan")
+
+    # Save final checkpoint unconditionally so each capacity in the sweep
+    # produces a recoverable model on disk. Same rationale as run_e2_7's
+    # final-save fix: a successful run should always leave loadable weights.
+    _wait()
+    if _is_main():
+        save_checkpoint(
+            trainer, cfg.n_steps - 1, cfg, logger, ckpt_dir,
+            keep_checkpoints=0,  # do not rotate the final save
+            accelerator=accelerator,
+        )
 
     _print(f"\n  {capacity}: final_acc={final_acc:.3f}  εV={mean_ev:.4f}  bias={mean_bias:.4f}")
 

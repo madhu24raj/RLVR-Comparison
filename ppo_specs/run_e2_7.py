@@ -363,14 +363,22 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
             _wait()
             return
 
-    # Save final checkpoint
-    if config.checkpoint_every > 0:
-        _wait()
-        if _is_main():
-            save_checkpoint(
-                trainer, config.n_steps - 1, config, logger, ckpt_dir,
-                config.keep_checkpoints, accelerator=accelerator,
-            )
+    # Save final checkpoint unconditionally so a successful run always produces
+    # a usable model on disk, even when periodic checkpointing was disabled
+    # (e.g. checkpoint_every=0 to save scratch space, or LOCAL_TEST runs that
+    # someone explicitly wants weights from). The single per-rank barrier
+    # before the rank-0 write is the same pattern as the periodic-save site.
+    _wait()
+    if _is_main():
+        save_checkpoint(
+            trainer, config.n_steps - 1, config, logger, ckpt_dir,
+            # keep_checkpoints=0 here means "do not rotate the final save":
+            # rotation only fires when keep_checkpoints > 0, so the final
+            # checkpoint is preserved even if the user set keep_checkpoints=1
+            # earlier and a periodic save would otherwise have evicted it.
+            keep_checkpoints=0,
+            accelerator=accelerator,
+        )
 
     if _is_main():
         logger.save()
