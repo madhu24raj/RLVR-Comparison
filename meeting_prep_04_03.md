@@ -21,6 +21,7 @@ The project foundation is in place. I built the shared infrastructure that all t
 - `format_prompt(question, system_prompt)` — Wraps a GSM8K question into a chat-style prompt compatible with Qwen and Llama tokenizers. Uses a system prompt that instructs the model to show work and end with `#### <number>`.
 
 - `get_experiment_subset(n=100, seed=42)` — Returns the standard 100-prompt training subset and the full test set. This is the function all experiments should call to ensure they're using the exact same data. The seed is fixed at 42 for reproducibility across all runs.
+- TF: is this function deleted?
 
 **Design decisions:**
 - 100-prompt train subset as specified in the project plan

@@ -1,449 +1,678 @@
 """
-GRPO (Group Relative Policy Optimization) trainer for RLVR on GSM8K.
+grpo_trl.py
+───────────
+GRPO trainer for E2.7 / E2.9, built on top of the shared project
+infrastructure described in the April 3 meeting notes.
 
-GRPO is PPO without a learned critic. Instead of training a value network,
-GRPO generates G completions per prompt and uses the group statistics
-(mean, std) as the baseline for advantage estimation:
+Depends on:
+  src/data.py       — get_experiment_subset(), format_prompt_with_template()
+  src/rewards.py    — trl_reward_fn, batch_reward
+  eval/metrics.py   — ExperimentLogger, accuracy, reward_variance,
+                      compute_mc_advantage, advantage_estimation_error
 
-    A_ig = (R_ig - mean(R_g)) / std(R_g)
+Key data.py facts that shape this file:
+  - get_experiment_subset() returns HuggingFace Dataset objects (not lists).
+    Columns: 'question', 'answer', 'ground_truth'.
+  - 'ground_truth' is already the extracted number string (e.g. "7"),
+    extracted by data.py's load_gsm8k() via .map(). Do NOT re-extract.
+  - format_prompt_with_template(question, tokenizer) is the correct call
+    for chat-template-aware formatting. format_prompt() is the plain fallback.
+  - The system prompt requests \\boxed{} (not ####) because Qwen has a
+    strong prior toward LaTeX. rewards.py accepts both formats.
 
-The policy loss uses the same per-token clipped surrogate as PPO.
+Key rewards.py facts:
+  - trl_reward_fn(completions, ground_truth, **kwargs) -> list[float]
+    Passes straight to batch_reward -> gsm8k_reward.
+  - gsm8k_reward expects ground_truth as a bare number string ("7"),
+    NOT the full GSM8K answer ("She has #### 7"). Already handled by data.py.
+  - Strict extraction: no "last number" fallback. Completions that don't
+    use ####, \\boxed{}, or "the answer is" get reward 0 (see rewards.py L13).
 
-Data flow:
-    B prompts
-        -> generate G completions each (B*G total)
-        -> score all with reward_fn
-        -> per-group advantage normalization
-        -> per-token clipped surrogate loss (K epochs)
+TRL's GRPOTrainer handles:
+  - G completions per prompt
+  - Group-normalised advantage computation
+  - PPO-clip surrogate + KL penalty against frozen ref model
+  - Mixed precision, gradient clipping
+
+We add:
+  - Plugging into the shared reward / data / logging interfaces
+  - Compute budget enforcement (matched completion count for E2.7)
+  - All E2.7 metrics: stability, convergence speed, εV
+  - Label regime support (full / sparse / noisy) for E2.9
+
+Usage:
+    python grpo_trl.py --seeds 0 1 2 --G 8 --completion_budget 8000
+    python grpo_trl.py --label_regime noisy --seeds 0 1 2   # E2.9
+    python grpo_trl.py --G 4 --output_dir results/e2_8/grpo_G4  # E2.8 sweep
+
+    # 2.7: grpo_trl.py --G 8 --completion_budget 800 --output_dir results/e2_7/grpo
 """
-from __future__ import annotations
 
-import sys
+import argparse
+import json
 import os
-
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
-
-import torch
-import numpy as np
-from dataclasses import dataclass
+import random
+import time
+from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+import numpy as np
+import torch
+from datasets import Dataset
+from transformers import AutoTokenizer, TrainerCallback
+from trl import GRPOConfig, GRPOTrainer
 
-from src.data import load_gsm8k, format_prompt_with_template
-from src.rewards import gsm8k_reward
-from eval.metrics import ExperimentLogger
-from eval.metrics import accuracy as compute_accuracy
-
-from grpo_specs.config import GRPOConfig
-from shared.per_token_loss import (
-    batched_per_token_log_probs,
-    clipped_surrogate_loss,
-    per_token_kl,
+# ── Shared project infrastructure ─────────────────────────────────────────────
+from src.data import get_experiment_subset, format_prompt_with_template
+from src.rewards import trl_reward_fn, batch_reward
+from eval.metrics import (
+    ExperimentLogger,
+    accuracy,
+    reward_variance,
+    compute_mc_advantage,
+    advantage_estimation_error,
 )
 
+# ── Constants ─────────────────────────────────────────────────────────────────
+# TODO: confirm model choice
+MODEL_NAME    = "Qwen/Qwen2.5-0.5B-Instruct"
+LABEL_REGIMES = ("full", "sparse", "noisy")
 
-# -- Data structures --
-
-@dataclass
-class Rollout:
-    prompt: str
-    completion: str
-    reward: float
-    full_ids: List[int]
-    prompt_len: int
-    group_idx: int  # which prompt group this belongs to
+SPARSE_KEEP_FRACTION = 0.10   # E2.9: keep 10% of reward labels
+NOISY_FLIP_PROB      = 0.10   # E2.9: flip 10% of reward labels
 
 
-@dataclass
-class GroupRolloutBatch:
-    rollouts: List[Rollout]
-    n_groups: int           # number of unique prompts (B)
-    group_size: int         # completions per prompt (G)
+# ══════════════════════════════════════════════════════════════════════════════
+# 1.  Label-regime reward wrappers
+#     Wrap trl_reward_fn from src/rewards.py. Regime logic lives here so
+#     shared infrastructure stays clean.
+# ══════════════════════════════════════════════════════════════════════════════
 
-    def rewards(self) -> torch.Tensor:
-        return torch.tensor([r.reward for r in self.rollouts], dtype=torch.float32)
+def make_sparse_reward_fn(seed: int = 42) -> Callable:
+    """
+    Sparse regime (E2.9): keep only SPARSE_KEEP_FRACTION of reward labels.
+    Masked examples always receive 0.0, regardless of correctness.
+    Mask is fixed per seed for reproducibility.
+    """
+    rng = random.Random(seed)
 
-    def group_rewards(self) -> List[List[float]]:
-        """Rewards organized by group: [[r_00, r_01, ...], [r_10, ...], ...]."""
-        groups = [[] for _ in range(self.n_groups)]
-        for r in self.rollouts:
-            groups[r.group_idx].append(r.reward)
-        return groups
+    def sparse_fn(completions: List[str], ground_truth: List[str], **kwargs) -> List[float]:
+        rewards = trl_reward_fn(completions, ground_truth, **kwargs)
+        return [r if rng.random() < SPARSE_KEEP_FRACTION else 0.0 for r in rewards]
+
+    return sparse_fn
 
 
-# -- GRPO Trainer --
+def make_noisy_reward_fn(seed: int = 42) -> Callable:
+    """
+    Noisy regime (E2.9): flip NOISY_FLIP_PROB fraction of reward labels.
+    1.0 -> 0.0 and 0.0 -> 1.0 with probability NOISY_FLIP_PROB.
+    """
+    rng = random.Random(seed)
 
-class GRPOTrainer:
-    """GRPO trainer for RLVR tasks with verifiable binary rewards."""
+    def noisy_fn(completions: List[str], ground_truth: List[str], **kwargs) -> List[float]:
+        rewards = trl_reward_fn(completions, ground_truth, **kwargs)
+        return [(1.0 - r) if rng.random() < NOISY_FLIP_PROB else r for r in rewards]
+
+    return noisy_fn
+
+
+def get_reward_fn(label_regime: str, seed: int) -> Callable:
+    """Return the appropriate TRL-compatible reward function for the regime."""
+    if label_regime == "sparse":
+        return make_sparse_reward_fn(seed=seed)
+    elif label_regime == "noisy":
+        return make_noisy_reward_fn(seed=seed)
+    else:
+        return trl_reward_fn   # full regime: use shared fn directly
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 2.  Dataset preparation
+#
+#     get_experiment_subset() returns HuggingFace Dataset objects with columns:
+#       'question'      — raw question string
+#       'answer'        — full GSM8K answer string (includes chain of thought)
+#       'ground_truth'  — already-extracted number string, e.g. "7"
+#
+#     We use 'ground_truth' directly — do NOT call extract_answer() again.
+#     TRL's GRPOTrainer passes dataset columns as **kwargs to the reward fn,
+#     so the 'ground_truth' column flows through to trl_reward_fn automatically.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_trl_dataset(hf_dataset: Dataset, tokenizer) -> Dataset:
+    """
+    Convert the shared HF Dataset into the format TRL's GRPOTrainer expects.
+
+    TRL requires a 'prompt' column. We keep 'ground_truth' so TRL passes it
+    to the reward function as a kwarg. The 'answer' column is dropped — we
+    only need ground_truth (already extracted).
+
+    Uses format_prompt_with_template() so the system prompt requests \\boxed{}
+    format, which Qwen produces more reliably than #### (see data.py comments).
+    """
+    def _format(example):
+        return {
+            "prompt":       format_prompt_with_template(example["question"], tokenizer=tokenizer),
+            "ground_truth": example["ground_truth"],  # already a bare number string
+        }
+
+    return hf_dataset.map(_format, remove_columns=hf_dataset.column_names)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 3.  Compute budget
+#     Shared across methods in E2.7 — same instance passed to PPO, GRPO, DPO.
+#     Completion counts per method per prompt:
+#       PPO:  1  (single rollout; critic not counted per spec)
+#       GRPO: G
+#       DPO:  2  (one positive, one negative)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ComputeBudget:
+    """
+    Tracks total completions generated and enforces a shared budget.
+    Pass the same instance to all three trainers for matched-compute E2.7.
+    """
+
+    def __init__(self, total_completions: int):
+        self.total = total_completions
+        self._used = 0
+        self._log: List[Tuple[int, str]] = []
+
+    def charge(self, n: int, method: str = "grpo"):
+        self._used += n
+        self._log.append((n, method))
+
+    def exhausted(self) -> bool:
+        return self._used >= self.total
+
+    @property
+    def used(self) -> int:
+        return self._used
+
+    def fraction_used(self) -> float:
+        return self._used / self.total
+
+    def summary(self) -> Dict:
+        by_method: Dict[str, int] = {}
+        for n, m in self._log:
+            by_method[m] = by_method.get(m, 0) + n
+        return {
+            "total_used":   self._used,
+            "total_budget": self.total,
+            "by_method":    by_method,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 4.  Advantage estimation error  εV
+#
+#     Uses compute_mc_advantage() and advantage_estimation_error() from
+#     eval/metrics.py for consistency with PPO's εV computation.
+#
+#     ground_truth passed to batch_reward() must be bare number strings —
+#     which they are, since we pull from the 'ground_truth' column that
+#     data.py already extracted.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def compute_epsilon_v(
+    model,
+    tokenizer,
+    eval_dataset: Dataset,         # HF Dataset with 'question' + 'ground_truth'
+    G_grpo: int,
+    G_oracle: int = 32,
+    n_prompts: int = 30,
+    device: str = "cuda",
+) -> float:
+    """
+    εV = E[ MAE(A_grpo, A_oracle) ]
+
+    A_oracle: G_oracle samples -> approximates true V(s) = E[r|s]
+    A_grpo:   G_grpo   samples -> what GRPO actually uses as baseline
+
+    Uses compute_mc_advantage() and advantage_estimation_error() from
+    eval/metrics.py so the metric is computed identically across all methods.
+    """
+    model.eval()
+    eps = 1e-6
+    all_estimated: List[float] = []
+    all_mc:        List[float] = []
+
+    n = min(n_prompts, len(eval_dataset))
+
+    with torch.no_grad():
+        for i in range(n):
+            example = eval_dataset[i]
+            # format_prompt_with_template for consistent prompt format
+            prompt = format_prompt_with_template(example["question"], tokenizer=tokenizer)
+            gt     = example["ground_truth"]   # already a bare number string
+
+            def _sample_rewards(G: int) -> List[float]:
+                enc = tokenizer(
+                    [prompt] * G,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=512,
+                    padding=True,
+                ).to(device)
+                out = model.generate(
+                    **enc,
+                    max_new_tokens=256,
+                    do_sample=True,
+                    temperature=0.9,
+                    pad_token_id=tokenizer.pad_token_id,
+                )
+                pl = enc["attention_mask"].sum(dim=1)
+                completions = [
+                    tokenizer.decode(out[j][pl[j]:], skip_special_tokens=True)
+                    for j in range(G)
+                ]
+                # batch_reward from src/rewards.py; gt is already extracted
+                return batch_reward(completions, [gt] * G)
+
+            # Oracle baseline
+            r_oracle = _sample_rewards(G_oracle)
+            mu_oracle = np.mean(r_oracle)
+            mc_adv = [r - mu_oracle for r in r_oracle]   
+
+            # GRPO group baseline
+            r_grpo   = _sample_rewards(G_grpo)
+            mu_grpo  = np.mean(r_grpo)
+            grpo_adv = [r - mu_grpo for r in r_grpo]
+
+            k = min(len(grpo_adv), len(mc_adv))
+            all_estimated.extend(grpo_adv[:k])
+            all_mc.extend(mc_adv[:k])
+
+    # advantage_estimation_error() from eval/metrics.py
+    return advantage_estimation_error(all_estimated, all_mc)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 5.  TRL callback — budget enforcement + logging
+# ══════════════════════════════════════════════════════════════════════════════
+
+class GRPOCallback(TrainerCallback):
+    """
+    Hooks into TRL's training loop to:
+      1. Charge the compute budget after each step (batch_size x G completions)
+      2. Log metrics to ExperimentLogger (eval/metrics.py)
+      3. Run periodic greedy-decode evaluation
+      4. Stop training when the compute budget is exhausted
+    """
 
     def __init__(
         self,
-        config: GRPOConfig,
-        model: AutoModelForCausalLM,
-        tokenizer: AutoTokenizer,
-        reward_fn: Callable[[str, str], float],
-        device: torch.device,
-        reference_model: Optional[AutoModelForCausalLM] = None,
+        budget:       ComputeBudget,
+        logger:       ExperimentLogger,
+        G:            int,
+        batch_size:   int,
+        eval_dataset: Dataset,       # HF Dataset with 'question' + 'ground_truth'
+        tokenizer,
+        device:       str,
+        eval_every:   int = 50,
     ):
-        self.config = config
-        self.model = model
-        self.tokenizer = tokenizer
-        self.reward_fn = reward_fn
-        self.device = device
+        self.budget       = budget
+        self.logger       = logger
+        self.G            = G
+        self.batch_size   = batch_size
+        self.eval_dataset = eval_dataset
+        self.tokenizer    = tokenizer
+        self.device       = device
+        self.eval_every   = eval_every
 
-        self.reference_model = reference_model
-        if reference_model is not None:
-            reference_model.eval()
-            for p in reference_model.parameters():
-                p.requires_grad_(False)
+        # Rolling history for stability metrics
+        self._rewards: List[float] = []
+        self._losses:  List[float] = []
 
-        if config.reference_kl_coeff > 0 and reference_model is None:
-            raise ValueError(
-                f"reference_kl_coeff={config.reference_kl_coeff} > 0 requires "
-                f"reference_model to be passed to GRPOTrainer.__init__."
+    def on_step_end(self, args, state, control, **kwargs):
+        # ── Charge budget: batch_size prompts x G completions ─────────────────
+        self.budget.charge(self.batch_size * self.G, method="grpo")
+
+        # ── Pull metrics from TRL's log history ───────────────────────────────
+        logs   = state.log_history[-1] if state.log_history else {}
+        reward = logs.get("reward",        logs.get("mean_reward", 0.0))
+        loss   = logs.get("loss",          logs.get("policy_loss", 0.0))
+        kl     = logs.get("kl_divergence", logs.get("kl",          0.0))
+
+        self._rewards.append(reward)
+        self._losses.append(loss)
+
+        # ── Log to shared ExperimentLogger ────────────────────────────────────
+        self.logger.log_step(
+            step=state.global_step,
+            reward=reward,
+            loss=loss,
+            kl=kl,
+            clip_fraction=logs.get("clip_fraction", 0.0),
+            budget_used=self.budget.used,
+            budget_fraction=self.budget.fraction_used(),
+        )
+
+        # ── Periodic evaluation ───────────────────────────────────────────────
+        if state.global_step % self.eval_every == 0:
+            model    = kwargs.get("model")
+            eval_acc = self._run_eval(model)
+            self.logger.log_step(step=state.global_step, eval_accuracy=eval_acc)
+            print(
+                f"  step {state.global_step:4d} | "
+                f"budget {self.budget.used}/{self.budget.total} "
+                f"({self.budget.fraction_used():.1%}) | "
+                f"eval_acc={eval_acc:.4f} | kl={kl:.4f}"
             )
 
-        self.optimizer = torch.optim.AdamW(
-            model.parameters(), lr=config.learning_rate
-        )
+        # ── Stop when budget exhausted ────────────────────────────────────────
+        if self.budget.exhausted():
+            print(f"\n[BUDGET] Exhausted at step {state.global_step}. Stopping.")
+            control.should_training_stop = True
 
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-        tokenizer.padding_side = "left"
-
-        self.total_rollouts = 0
-
-    # -- Rollout generation --
-
-    @torch.no_grad()
-    def generate_group_rollouts(
-        self,
-        prompts: List[str],
-        ground_truths: List[str],
-    ) -> GroupRolloutBatch:
-        """Generate G completions per prompt, score each with reward_fn."""
-        self.model.eval()
-        G = self.config.n_rollouts_per_prompt
-        B = len(prompts)
-
-        # Repeat each prompt G times for batched generation
-        expanded_prompts = []
-        expanded_gts = []
-        group_indices = []
-        for i, (p, gt) in enumerate(zip(prompts, ground_truths)):
-            for _ in range(G):
-                expanded_prompts.append(p)
-                expanded_gts.append(gt)
-                group_indices.append(i)
-
-        # Tokenize all B*G prompts
-        enc = self.tokenizer(
-            expanded_prompts, return_tensors="pt", truncation=True,
-            max_length=512, padding=True,
-        ).to(self.device)
-        prompt_lens = enc["attention_mask"].sum(dim=1).tolist()
-
-        # Generate
-        out = self.model.generate(
-            input_ids=enc["input_ids"],
-            attention_mask=enc["attention_mask"],
-            max_new_tokens=self.config.max_new_tokens,
-            do_sample=self.config.do_sample,
-            temperature=self.config.temperature,
-            pad_token_id=self.tokenizer.pad_token_id,
-        )
-
-        # Build rollouts
-        rollouts = []
-        for i in range(B * G):
-            pad_len = (enc["input_ids"][i] == self.tokenizer.pad_token_id).sum().item()
-            real_start = pad_len
-            prompt_len = prompt_lens[i]
-            full_ids = out[i][real_start:]
-
-            completion = self.tokenizer.decode(
-                full_ids[prompt_len:], skip_special_tokens=True
-            )
-            reward = self.reward_fn(completion, expanded_gts[i])
-
-            rollouts.append(Rollout(
-                prompt=expanded_prompts[i],
-                completion=completion,
-                reward=reward,
-                full_ids=full_ids.tolist(),
-                prompt_len=prompt_len,
-                group_idx=group_indices[i],
-            ))
-
-        self.total_rollouts += len(rollouts)
-        return GroupRolloutBatch(
-            rollouts=rollouts,
-            n_groups=B,
-            group_size=G,
-        )
-
-    # -- Group advantage estimation --
-
-    def compute_group_advantages(
-        self,
-        batch: GroupRolloutBatch,
-    ) -> torch.Tensor:
-        """Per-sample advantage using group-relative normalization.
-
-        For each prompt group g with G completions:
-            A_ig = (R_ig - mean(R_g)) / max(std(R_g), eps)
-
-        When all rewards in a group are identical (std=0), advantages
-        are set to 0 for that group (no gradient signal, no NaN).
-
-        Returns: [B*G] tensor of advantages.
+    def _run_eval(self, model, n_eval: int = 100, batch_size: int = 16) -> float:
         """
-        group_rewards = batch.group_rewards()
-        advantages = torch.zeros(len(batch.rollouts), dtype=torch.float32)
+        Greedy-decode accuracy on the first n_eval examples of eval_dataset.
 
-        for g, rewards_g in enumerate(group_rewards):
-            rewards_t = torch.tensor(rewards_g, dtype=torch.float32)
-            mean_g = rewards_t.mean()
-            std_g = rewards_t.std()
+        Prompts are formatted with format_prompt_with_template() for
+        consistency. ground_truth is pulled from the 'ground_truth' column
+        (already a bare number string — no re-extraction needed).
+        """
+        if model is None:
+            return 0.0
+        model.eval()
+        rewards_all: List[float] = []
+        n = min(n_eval, len(self.eval_dataset))
 
-            if std_g < 1e-8:
-                # All rewards identical in this group. No signal.
-                adv_g = torch.zeros_like(rewards_t)
-            else:
-                adv_g = (rewards_t - mean_g) / (std_g + 1e-8)
+        with torch.no_grad():
+            for start in range(0, n, batch_size):
+                batch = self.eval_dataset.select(range(start, min(start + batch_size, n)))
+                prompts = [
+                    format_prompt_with_template(ex["question"], tokenizer=self.tokenizer)
+                    for ex in batch
+                ]
+                gts = [ex["ground_truth"] for ex in batch]  # already extracted
 
-            # Place into the flat advantages tensor
-            start = g * batch.group_size
-            end = start + len(rewards_g)
-            advantages[start:end] = adv_g
+                enc = self.tokenizer(
+                    prompts, return_tensors="pt",
+                    truncation=True, max_length=512, padding=True,
+                ).to(self.device)
+                out = model.generate(
+                    **enc,
+                    max_new_tokens=256,
+                    do_sample=False,   # greedy for deterministic eval
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
+                pl = enc["attention_mask"].sum(dim=1)
+                completions = [
+                    self.tokenizer.decode(out[i][pl[i]:], skip_special_tokens=True)
+                    for i in range(len(prompts))
+                ]
+                rewards_all.extend(batch_reward(completions, gts))
 
-        return advantages.to(self.device)
+        model.train()
+        return accuracy(rewards_all)   # eval/metrics.py
 
-    # -- Per-token log probs --
-
-    def _per_token_log_probs(
-        self,
-        all_full_ids: List[List[int]],
-        prompt_lens: List[int],
-        model_override: Optional[AutoModelForCausalLM] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        model = model_override if model_override is not None else self.model
-        return batched_per_token_log_probs(
-            model, all_full_ids, prompt_lens,
-            self.tokenizer.pad_token_id, self.device,
-        )
-
-    # -- GRPO update --
-
-    def grpo_update(
-        self,
-        batch: GroupRolloutBatch,
-        precomputed_advantages: torch.Tensor,
-        precomputed_old_per_token: torch.Tensor,
-        precomputed_mask: torch.Tensor,
-        precomputed_ref_per_token: Optional[torch.Tensor] = None,
-    ) -> Dict[str, float]:
-        """One GRPO gradient step on the collected batch."""
-        self.model.train()
-
-        old_per_token = precomputed_old_per_token.detach()
-        mask = precomputed_mask.detach()
-        advantages = precomputed_advantages.detach()
-
-        # New log probs (with grad)
-        new_per_token, _ = self._per_token_log_probs(
-            [r.full_ids for r in batch.rollouts],
-            [r.prompt_len for r in batch.rollouts],
-        )
-
-        # Clipped surrogate loss
-        policy_loss, clip_fraction, _ = clipped_surrogate_loss(
-            new_per_token, old_per_token, advantages, mask,
-            clip_epsilon=self.config.clip_epsilon,
-        )
-
-        # KL penalty (old vs new)
-        kl = per_token_kl(old_per_token, new_per_token, mask)
-
-        # Reference KL anchor
-        kl_ref = torch.tensor(0.0, device=self.device)
-        if (precomputed_ref_per_token is not None
-                and self.config.reference_kl_coeff > 0):
-            ref_per_token = precomputed_ref_per_token.detach()
-            kl_ref = per_token_kl(new_per_token, ref_per_token, mask)
-
-        # Combined loss
-        total_loss = (policy_loss
-                      + self.config.kl_coeff * kl
-                      + self.config.reference_kl_coeff * kl_ref)
-
-        self.optimizer.zero_grad()
-        total_loss.backward()
-
-        policy_grad_norm = torch.nn.utils.clip_grad_norm_(
-            self.model.parameters(), max_norm=1.0,
-        )
-        self.optimizer.step()
-
-        rewards = batch.rewards().to(self.device)
+    def stability_metrics(self, window: int = 50) -> Dict[str, float]:
+        """
+        Training stability over last `window` steps.
+        """
+        r = self._rewards[-window:]
+        l = self._losses[-window:]
+        # r_var = r_var = float(np.var(self._rewards[-window:])) # TODO: double-check reward variance (within time stamp or across time stamp)
         return {
-            "policy_loss": policy_loss.item(),
-            "policy_grad_norm": float(policy_grad_norm),
-            "kl_divergence": kl.item(),
-            "kl_ref_divergence": kl_ref.item(),
-            "mean_reward": rewards.mean().item(),
-            "reward_variance": rewards.var().item(),
-            "mean_advantage": advantages.mean().item(),
-            "clip_fraction": clip_fraction.item(),
+            "reward_mean":          float(np.mean(r)) if r else 0.0,
+            "reward_std":           float(np.std(r))  if r else 0.0,
+            "loss_mean":            float(np.mean(l)) if l else 0.0,
+            "loss_std":             float(np.std(l))  if l else 0.0,
+            # "reward_variance_mean": float(np.mean(r_var)) if r_var else 0.0,
         }
 
-    # -- Train step (rollout + K updates) --
 
-    def train_step(
-        self,
-        prompts: List[str],
-        ground_truths: List[str],
-    ) -> Dict[str, float]:
-        """Single GRPO iteration: generate G rollouts per prompt, K updates."""
-        batch = self.generate_group_rollouts(prompts, ground_truths)
+# ══════════════════════════════════════════════════════════════════════════════
+# 6.  TRL GRPOConfig builder
+# ══════════════════════════════════════════════════════════════════════════════
 
-        # Compute group advantages once
-        advantages = self.compute_group_advantages(batch)
+def build_grpo_config(args, seed: int) -> GRPOConfig:
+    return GRPOConfig(
+        model_name_or_path=args.model,
+        output_dir=os.path.join(args.output_dir, f"seed{seed}"),
 
-        # Freeze per-token old log probs once
-        with torch.no_grad():
-            fixed_old_per_token, fixed_mask = self._per_token_log_probs(
-                [r.full_ids for r in batch.rollouts],
-                [r.prompt_len for r in batch.rollouts],
-            )
-        fixed_old_per_token = fixed_old_per_token.detach()
-        fixed_mask = fixed_mask.detach()
+        # GRPO group size — sweep {4, 8, 16} for E2.8
+        num_generations=args.G,
 
-        # Freeze reference log probs once (if enabled)
-        fixed_ref_per_token: Optional[torch.Tensor] = None
-        if self.reference_model is not None and self.config.reference_kl_coeff > 0:
-            with torch.no_grad():
-                ref_per_token, _ = self._per_token_log_probs(
-                    [r.full_ids for r in batch.rollouts],
-                    [r.prompt_len for r in batch.rollouts],
-                    model_override=self.reference_model,
-                )
-            fixed_ref_per_token = ref_per_token.detach()
+        # Generation
+        max_prompt_length=512,
+        max_completion_length=512,
+        temperature=0.7,
+        top_p=0.9,
 
-        # K epochs
-        all_metrics: List[Dict[str, float]] = []
-        for epoch in range(self.config.n_ppo_epochs):
-            metrics = self.grpo_update(
-                batch,
-                precomputed_advantages=advantages,
-                precomputed_old_per_token=fixed_old_per_token,
-                precomputed_mask=fixed_mask,
-                precomputed_ref_per_token=fixed_ref_per_token,
-            )
-            all_metrics.append(metrics)
+        # PPO-clip
+        epsilon=0.2,
 
-        # Average metrics over epochs
-        avg = {}
-        for key in all_metrics[0]:
-            avg[key] = float(np.mean([m[key] for m in all_metrics]))
+        # KL against frozen reference model
+        beta=0.04,
 
-        # Add accuracy
-        rewards = [r.reward for r in batch.rollouts]
-        avg["accuracy"] = compute_accuracy(rewards)
-        avg["total_rollouts"] = self.total_rollouts
+        # Optimiser
+        learning_rate=1e-5,
+        per_device_train_batch_size=args.batch_size,
+        gradient_accumulation_steps=1,
+        max_grad_norm=1.0,
 
-        return avg
+        # Set high — budget callback controls early stopping
+        num_train_epochs=100,
 
-    # -- Evaluation --
-
-    @torch.no_grad()
-    def evaluate(
-        self,
-        prompts: List[str],
-        ground_truths: List[str],
-        n_eval: Optional[int] = None,
-    ) -> float:
-        """Evaluate policy accuracy with greedy decoding."""
-        self.model.eval()
-        if n_eval is not None:
-            prompts = prompts[:n_eval]
-            ground_truths = ground_truths[:n_eval]
-
-        eval_batch_size = min(8, len(prompts))
-        rewards: List[float] = []
-
-        for start in range(0, len(prompts), eval_batch_size):
-            batch_p = prompts[start:start + eval_batch_size]
-            batch_gt = ground_truths[start:start + eval_batch_size]
-
-            enc = self.tokenizer(
-                batch_p, return_tensors="pt", truncation=True,
-                max_length=512, padding=True,
-            ).to(self.device)
-
-            out = self.model.generate(
-                input_ids=enc["input_ids"],
-                attention_mask=enc["attention_mask"],
-                max_new_tokens=self.config.max_new_tokens,
-                do_sample=False,
-                pad_token_id=self.tokenizer.pad_token_id,
-            )
-
-            for i, gt in enumerate(batch_gt):
-                prompt_len = enc["attention_mask"][i].sum().item()
-                pad_len = (enc["input_ids"][i] == self.tokenizer.pad_token_id).sum().item()
-                real_start = pad_len
-                completion = self.tokenizer.decode(
-                    out[i][real_start + prompt_len:], skip_special_tokens=True
-                )
-                rewards.append(self.reward_fn(completion, gt))
-
-        return compute_accuracy(rewards)
+        logging_steps=args.log_every,
+        report_to="none",
+        seed=seed,
+        bf16=torch.cuda.is_available(),
+        dataloader_num_workers=0,
+        remove_unused_columns=False,   # keep ground_truth column for reward fn
+    )
 
 
-# -- Factory --
+# ══════════════════════════════════════════════════════════════════════════════
+# 7.  Single-seed run
+# ══════════════════════════════════════════════════════════════════════════════
 
-def load_grpo_trainer(config: GRPOConfig, device: torch.device) -> GRPOTrainer:
-    """Load model, tokenizer, and optionally reference model."""
-    if config.torch_dtype == "auto":
-        torch_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
-    elif config.torch_dtype == "bfloat16":
-        torch_dtype = torch.bfloat16
-    else:
-        torch_dtype = torch.float32
+def run_single_seed(args, seed: int, budget: ComputeBudget) -> Dict:
+    """Full GRPO training run for one seed. Returns all E2.7 / E2.9 metrics."""
 
-    print(f"[GRPO] Loading model: {config.model_name} (device={device}, dtype={torch_dtype})")
+    # ── Reproducibility ───────────────────────────────────────────────────────
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"\n{'='*64}")
+    print(f"  GRPO | seed={seed} | G={args.G} | regime={args.label_regime}")
+    print(f"{'='*64}")
+
+    # ── Tokenizer ─────────────────────────────────────────────────────────────
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
-        dtype=torch_dtype,
-    ).to(device)
+    # ── Data ──────────────────────────────────────────────────────────────────
+    # get_experiment_subset() returns HF Datasets with 'ground_truth' already
+    # extracted (bare number strings). seed=42 is fixed inside; all methods
+    # see identical splits.
+    train_hf, test_hf = get_experiment_subset(n=100, seed=42)
 
-    reference_model = None
-    if config.reference_kl_coeff > 0:
-        print(f"[GRPO] reference_kl_coeff={config.reference_kl_coeff} > 0; "
-              f"loading frozen reference model (doubles weight memory)")
-        reference_model = AutoModelForCausalLM.from_pretrained(
-            config.model_name,
-            dtype=torch_dtype,
-        ).to(device)
-        reference_model.eval()
-        for p in reference_model.parameters():
-            p.requires_grad_(False)
+    train_ds = build_trl_dataset(train_hf, tokenizer)
+    eval_ds  = build_trl_dataset(test_hf,  tokenizer)
 
-    return GRPOTrainer(
-        config=config,
-        model=model,
-        tokenizer=tokenizer,
-        reward_fn=gsm8k_reward,
-        device=device,
-        reference_model=reference_model,
+    # ── Reward function — regime-aware ────────────────────────────────────────
+    reward_fn = get_reward_fn(args.label_regime, seed=seed)
+
+    # ── ExperimentLogger ──────────────────────────────────────────────────────
+    # Naming convention: exp_2_7_grpo_seed0 / exp_2_9_grpo_noisy_seed0
+    exp_name = f"exp_2_7_grpo_seed{seed}"
+    if args.label_regime != "full":
+        exp_name = f"exp_2_9_grpo_{args.label_regime}_seed{seed}"
+
+    logger = ExperimentLogger(
+        experiment_name=exp_name,
+        method="grpo",
+        config={
+            "model":             args.model,
+            "G":                 args.G,
+            "label_regime":      args.label_regime,
+            "seed":              seed,
+            "batch_size":        args.batch_size,
+            "completion_budget": args.completion_budget,
+        },
     )
+
+    # ── TRL GRPOTrainer ───────────────────────────────────────────────────────
+    grpo_cfg = build_grpo_config(args, seed)
+    trainer  = GRPOTrainer(
+        config=grpo_cfg,
+        reward_funcs=reward_fn,
+        train_dataset=train_ds,
+        eval_dataset=eval_ds,
+    )
+
+    # ── Callback — budget enforcement + metric logging ────────────────────────
+    callback = GRPOCallback(
+        budget=budget,
+        logger=logger,
+        G=args.G,
+        batch_size=args.batch_size,
+        eval_dataset=test_hf,     # pass original HF Dataset (has 'question' col)
+        tokenizer=tokenizer,
+        device=device,
+        eval_every=args.eval_every,
+    )
+    trainer.add_callback(callback)
+
+    # ── Train ─────────────────────────────────────────────────────────────────
+    t_start = time.time()
+    trainer.train()
+    wall_time = time.time() - t_start
+
+    # ── Final accuracy ────────────────────────────────────────────────────────
+    final_acc = callback._run_eval(trainer.model, n_eval=100)
+    print(f"\n  Final accuracy: {final_acc:.4f}")
+
+    # ── εV — advantage estimation error ──────────────────────────────────────
+    print("  Computing εV (advantage estimation error)...")
+    eps_v = compute_epsilon_v(
+        model=trainer.model,
+        tokenizer=tokenizer,
+        eval_dataset=test_hf,    # original HF Dataset with 'question' column
+        G_grpo=args.G,
+        G_oracle=32,
+        n_prompts=30,
+        device=device,
+    )
+    print(f"  εV = {eps_v:.6f}")
+
+    # ── Stability metrics ─────────────────────────────────────────────────────
+    stability = callback.stability_metrics(window=50)
+
+    # ── Save via ExperimentLogger ─────────────────────────────────────────────
+    logger.log_step(
+        step=-1,   # sentinel: final summary entry
+        final_accuracy=final_acc,
+        advantage_error_eps_v=eps_v,
+        wall_time_s=wall_time,
+        **stability,
+        **budget.summary(),
+    )
+    logger.save()
+
+    return {
+        "seed":         seed,
+        "label_regime": args.label_regime,
+        "G":            args.G,
+        "final": {
+            "eval_accuracy":         final_acc,
+            "advantage_error_eps_v": eps_v,
+            "loss_std":              stability["loss_std"],
+            "reward_std":            stability["reward_std"],
+            "reward_mean":           stability["reward_mean"],
+            "wall_time_s":           wall_time,
+            "total_completions":     budget.used,
+        },
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 8.  Multi-seed aggregation
+# ══════════════════════════════════════════════════════════════════════════════
+
+def aggregate(results: List[Dict]) -> Dict:
+    """Mean +/- std across seeds for all scalar final metrics."""
+    keys    = list(results[0]["final"].keys())
+    summary = {"n_seeds": len(results), "seeds": [r["seed"] for r in results]}
+    for k in keys:
+        vals = [r["final"][k] for r in results if r["final"].get(k) is not None]
+        if vals and isinstance(vals[0], (int, float)):
+            summary[f"{k}_mean"] = float(np.mean(vals))
+            summary[f"{k}_std"]  = float(np.std(vals))
+    return summary
+
+
+def print_summary(summary: Dict, args):
+    print(f"\n{'='*64}")
+    print(f"  GRPO | G={args.G} | regime={args.label_regime} | {summary['n_seeds']} seeds")
+    print(f"{'='*64}")
+    rows = [
+        ("eval_accuracy",         "Accuracy"),
+        ("loss_std",              "Loss std (stability)"),
+        ("reward_std",            "Reward std (stability)"),
+        ("advantage_error_eps_v", "εV (advantage error)"),
+    ]
+    for key, label in rows:
+        mu  = summary.get(f"{key}_mean")
+        std = summary.get(f"{key}_std")
+        if mu is not None:
+            print(f"  {label:<30s}: {mu:.4f} +/- {std:.4f}")
+    print(f"{'='*64}\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 9.  CLI
+# ══════════════════════════════════════════════════════════════════════════════
+
+def parse_args():
+    p = argparse.ArgumentParser(description="GRPO trainer for E2.7 / E2.8 / E2.9")
+    p.add_argument("--model",      default=MODEL_NAME)
+    p.add_argument("--seeds",      nargs="+", type=int, default=[0, 1, 2])
+    p.add_argument("--G",          type=int,  default=8,
+                   help="GRPO group size — sweep {4, 8, 16} for E2.8")
+    p.add_argument("--completion_budget", type=int, default=8000,
+                   help="Total completions budget shared with PPO / DPO (E2.7)")
+    p.add_argument("--batch_size",  type=int, default=4,
+                   help="Prompts per step; effective completions = batch_size x G")
+    p.add_argument("--eval_every",  type=int, default=50)
+    p.add_argument("--log_every",   type=int, default=10)
+    p.add_argument("--label_regime", choices=LABEL_REGIMES, default="full",
+                   help="Label regime for E2.9 (full / sparse / noisy)")
+    p.add_argument("--output_dir",  default="results/e2_7/grpo")
+    return p.parse_args()
+
+
+def main():
+    args    = parse_args()
+    results = []
+    for seed in args.seeds:
+        # Each seed gets its own budget — seeds are independent runs
+        budget = ComputeBudget(total_completions=args.completion_budget)
+        result = run_single_seed(args, seed=seed, budget=budget)
+        results.append(result)
+
+    summary = aggregate(results)
+    print_summary(summary, args)
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = out_dir / f"grpo_{args.label_regime}_summary.json"
+    with open(summary_path, "w") as f:
+        json.dump(summary, f, indent=2)
+    print(f"Summary -> {summary_path}")
+
+
+if __name__ == "__main__":
+    main()

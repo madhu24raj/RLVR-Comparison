@@ -38,20 +38,20 @@ def advantage_estimation_error(
     return float(np.mean(np.abs(estimated_advantages - mc_advantages)))
 
 
+## NOTE: changed 5/5 TF (used to only compute mean reward)
 def compute_mc_advantage(
     rewards_per_prompt: dict[str, list[float]],
-) -> dict[str, float]:
-    """Compute Monte Carlo ground-truth advantage for each (prompt, completion).
+) -> dict[str, list[float]]:          
+    """Compute Monte Carlo advantage for each (prompt, completion).
 
-    For each prompt, the MC advantage of completion i is:
-        A_MC_i = r_i - mean(all rewards for this prompt)
+    A_MC_i = r_i - mean(all rewards for this prompt)
 
-    In practice, we estimate this with many rollouts (ideally 1000 per prompt).
+    Returns a list of advantages (one per completion) for each prompt.
     """
     mc_advantages = {}
     for prompt, rewards in rewards_per_prompt.items():
         mean_reward = np.mean(rewards)
-        mc_advantages[prompt] = mean_reward  # The baseline
+        mc_advantages[prompt] = [r - mean_reward for r in rewards]
     return mc_advantages
 
 
@@ -169,4 +169,4 @@ if __name__ == "__main__":
     for i in range(10):
         logger.log_step(i, accuracy=0.3 + i * 0.05, reward_mean=0.3 + i * 0.04)
     logger.save()
-    print("Logger test passed.")
+    print("Logger test passed.") #??
