@@ -214,15 +214,25 @@ def run_one_capacity(
 
 def run_e2_8(config: PPOConfig, capacities: list[str]) -> None:
     if USE_DDP:
-        from accelerate import Accelerator
+        from accelerate import Accelerator, DistributedDataParallelKwargs
         from accelerate.utils import set_seed as accelerate_set_seed
-        accelerator = Accelerator()
+        # find_unused_parameters=False: fail-fast if any param is dropped
+        # from the grad pass (and ~5-10 ms/step faster than the default).
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+        accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
         device = accelerator.device
         accelerate_set_seed(config.seed)
         assert config.batch_size % accelerator.num_processes == 0, (
             f"config.batch_size={config.batch_size} not divisible by "
             f"accelerator.num_processes={accelerator.num_processes}"
         )
+        # Multi-node guard: see run_e2_7.py for rationale.
+        if accelerator.num_machines > 1 and not os.environ.get("MASTER_ADDR"):
+            raise RuntimeError(
+                f"Accelerator num_machines={accelerator.num_machines} but "
+                f"MASTER_ADDR is unset. Multi-node training requires "
+                f"MASTER_ADDR/MASTER_PORT (out-of-scope for Phase 2)."
+            )
     else:
         accelerator = None
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

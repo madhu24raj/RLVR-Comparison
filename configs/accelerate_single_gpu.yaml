@@ -6,7 +6,8 @@ enable_cpu_affinity: false
 gpu_ids: all
 machine_rank: 0
 main_training_function: main
-mixed_precision: bf16
+# Weights loaded as bf16 by `load_ppo_trainer`; no autocast needed.
+mixed_precision: 'no'
 num_machines: 1
 num_processes: 1
 rdzv_backend: static

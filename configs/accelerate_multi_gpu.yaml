@@ -8,7 +8,13 @@ machine_rank: 0
 main_process_ip: null
 main_process_port: 29500
 main_training_function: main
-mixed_precision: bf16
+# Weights are loaded as bf16 directly by `load_ppo_trainer` (config.torch_dtype="auto").
+# Setting mixed_precision: 'no' avoids a no-op autocast wrapper and keeps AdamW
+# operating on the same bf16 tensors that hold the weights — avoiding the fp32
+# master-weight illusion that would NOT actually exist with bf16-loaded weights.
+# For long 8B runs, pair this with --optimizer-8bit (bnb 8-bit AdamW) to
+# control roundoff accumulation.
+mixed_precision: 'no'
 num_machines: 1
 num_processes: 4
 rdzv_backend: static

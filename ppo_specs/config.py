@@ -53,7 +53,10 @@ class PPOConfig:
                                      # roughly doubles VRAM (loads a second model).
     critic_loss_coeff: float = 0.5  # weight on critic MSE loss in total_loss
     grad_clip_norm: float = 1.0     # max gradient norm for policy and critic
-    log_ratio_clip: float = 20.0    # clamp log-ratio before exp() to prevent overflow
+    log_ratio_clip: float = 10.0    # clamp log-ratio before exp() to prevent overflow.
+                                    # Healthy PPO rarely sees |log_ratio| > 1; 10 catches
+                                    # numerical pathology (collapsed policy) earlier than
+                                    # the previous 20 without affecting any normal regime.
 
     # ── Reward model settings ────────────────────────────────────────────────
     reward_mode: str = "deterministic"   # "deterministic" | "self_judge" | "combined"

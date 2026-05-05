@@ -24,6 +24,7 @@ def batched_per_token_log_probs(
     prompt_lens: List[int],
     pad_token_id: int,
     device: torch.device,
+    requires_grad: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Per-token response log-probs for a batch.
 
@@ -37,11 +38,23 @@ def batched_per_token_log_probs(
         prompt_lens:   prompt lengths (so we can slice off the response).
         pad_token_id:  tokenizer's pad token id for padding.
         device:        torch device.
+        requires_grad: if False, runs the forward pass under
+                       `torch.no_grad()` (defense-in-depth for frozen
+                       reference / RM models — prevents accidental graph
+                       allocation if a future caller forgets the outer
+                       no-grad envelope). Default True preserves the
+                       existing PPO policy-update path.
 
     Returns:
         log_probs: [B, T_max_response]  per-token log probs (response only)
         mask:      [B, T_max_response]  1 where real, 0 where padding
     """
+    if not requires_grad:
+        with torch.no_grad():
+            return batched_per_token_log_probs(
+                model, all_full_ids, prompt_lens,
+                pad_token_id, device, requires_grad=True,
+            )
     B = len(all_full_ids)
     max_len = max(len(ids) for ids in all_full_ids)
     padded = torch.full(

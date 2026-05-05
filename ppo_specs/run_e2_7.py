@@ -59,9 +59,13 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
     # identical to the legacy single-process path.
     USE_DDP = "LOCAL_RANK" in os.environ
     if USE_DDP:
-        from accelerate import Accelerator
+        from accelerate import Accelerator, DistributedDataParallelKwargs
         from accelerate.utils import set_seed as accelerate_set_seed
-        accelerator = Accelerator()
+        # find_unused_parameters=False: fail-fast if a future code path drops
+        # a parameter from the gradient pass, AND saves ~5-10 ms/step (DDP's
+        # auto-detection is otherwise on by default).
+        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+        accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
         device = accelerator.device
         # One Accelerate seed call covers python/numpy/torch/torch.cuda streams.
         accelerate_set_seed(config.seed)
@@ -71,6 +75,18 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
             f"accelerator.num_processes={accelerator.num_processes}; "
             f"adjust config."
         )
+        # Multi-node guard (§7.6 W4): if the user bumped num_machines but
+        # didn't set up rendezvous env vars, fail loudly instead of hanging
+        # in NCCL connect. Multi-node is out-of-scope for Phase 2 — see
+        # ddp_cpu_gpu_migration.md §10.
+        if accelerator.num_machines > 1 and not os.environ.get("MASTER_ADDR"):
+            raise RuntimeError(
+                f"Accelerator num_machines={accelerator.num_machines} but "
+                f"MASTER_ADDR is unset. Multi-node training requires "
+                f"MASTER_ADDR/MASTER_PORT in the environment (set them in "
+                f"the SLURM script from $SLURM_NODELIST). Multi-node is "
+                f"out-of-scope for Phase 2; see ddp_cpu_gpu_migration.md §10."
+            )
     else:
         accelerator = None
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

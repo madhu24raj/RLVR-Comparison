@@ -132,8 +132,15 @@ export WANDB_TAGS="ppo,e2.7,seed${SEED}"
 # SLURM sends SIGUSR1 120s before killing the job. Forward to the Python
 # child so GracefulExitHandler saves a checkpoint, then requeue.
 handle_preempt() {
-    echo "[PREEMPT] Received SIGUSR1 — forwarding to Python child..."
-    kill -SIGUSR1 $CHILD_PID 2>/dev/null || true
+    echo "[PREEMPT] Received SIGUSR1 — forwarding to Python children..."
+    # Under `accelerate launch`, $CHILD_PID is the launcher PID. The actual
+    # rank-0 worker is its child. Walk the process tree with pkill -P so
+    # every Python child of the launcher receives SIGUSR1 — direct
+    # `kill -SIGUSR1 $CHILD_PID` would only signal the launcher, which
+    # does not forward custom signals to its children.
+    pkill -SIGUSR1 -P "$CHILD_PID" 2>/dev/null || true
+    # Also signal the launcher itself, in case it grew a handler.
+    kill -SIGUSR1 "$CHILD_PID" 2>/dev/null || true
     # Wait briefly for the GracefulExitHandler to save a checkpoint
     sleep 30
     echo "[PREEMPT] Requeueing job ${SLURM_JOB_ID}..."

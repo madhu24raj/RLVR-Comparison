@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest --collect-only ppo_specs/tests/)",
+      "Bash(where python *)",
+      "Bash(py -3 -c \"import sys; print\\(sys.executable, sys.version_info\\)\")"
+    ]
+  }
+}

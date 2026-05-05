@@ -194,8 +194,112 @@ class SelfJudgeRewardModel:
 
     @torch.no_grad()
     def batch_score(self, questions: list[str], completions: list[str]) -> list[float]:
-        """Score a batch of question-completion pairs."""
-        return [self.score(q, c) for q, c in zip(questions, completions)]
+        """Score a batch of (question, completion) pairs in ONE forward pass.
+
+        Phase 1 fused implementation per
+        ppo_specs/specs/reward_model_integration.md "Performance gap":
+        replaces the previous per-sample loop (B × `score()`) with a single
+        batched forward through the reference model and a vectorized
+        completion-mask aggregation. At 8B with B=16 this saves ~1.4 s/step
+        of pure single-sample inference (~5 minutes per 200-step run).
+
+        Falls back to the per-sample path on three edge cases that the
+        fused vector math does not handle cleanly:
+          - empty `completions` list (B == 0)
+          - any completion is empty (`""`) — would yield n_completion=0
+          - a question + completion pair tokenizes to the same length as
+            the question alone (no completion tokens at all)
+
+        The per-sample fallback returns the same values as the unbatched
+        `score()` method, including normalization handling.
+
+        Returns a list of floats (length B), matching the legacy signature.
+        """
+        if not completions:
+            return []
+
+        # Pre-tokenize each (q, c) pair to capture the prompt boundary.
+        # We tokenize the full text and the question separately so the
+        # completion-token region is unambiguous regardless of how the
+        # tokenizer handles whitespace at the boundary.
+        question_ids_per: list[list[int]] = []
+        full_ids_per: list[list[int]] = []
+        completion_lens: list[int] = []
+        for q, c in zip(questions, completions):
+            if not c:
+                # Edge case: empty completion — fall back to per-sample
+                # path for the entire batch (rare; preserves bit-identical
+                # output for completeness).
+                return [self.score(q, c) for q, c in zip(questions, completions)]
+            qid = self.tokenizer.encode(q, add_special_tokens=False)
+            fid = self.tokenizer.encode(q + c, add_special_tokens=False)
+            n_comp = len(fid) - len(qid)
+            if n_comp <= 0:
+                return [self.score(q, c) for q, c in zip(questions, completions)]
+            question_ids_per.append(qid)
+            full_ids_per.append(fid)
+            completion_lens.append(n_comp)
+
+        B = len(full_ids_per)
+        max_len = max(len(ids) for ids in full_ids_per)
+        pad_id = self.tokenizer.pad_token_id
+        device = next(self.model.parameters()).device
+
+        padded = torch.full(
+            (B, max_len), pad_id, dtype=torch.long, device=device,
+        )
+        attention_mask = torch.zeros(B, max_len, dtype=torch.long, device=device)
+        for i, ids in enumerate(full_ids_per):
+            padded[i, :len(ids)] = torch.tensor(ids, dtype=torch.long, device=device)
+            attention_mask[i, :len(ids)] = 1
+
+        # ONE batched forward pass. The reference model is frozen; outer
+        # @torch.no_grad() decorator already prevents graph allocation.
+        outputs = self.model(input_ids=padded, attention_mask=attention_mask)
+        # logits[b, t, v] predicts token at position t+1 — fp32 cast
+        # preserves the same numerics as the per-sample path's log_softmax.
+        logits = outputs.logits.float()
+
+        # Build a [B, max_len] mask over completion-token positions.
+        # Token at position t in `padded` is a completion token iff
+        #   len(question_ids[i]) <= t < len(full_ids[i])
+        # We score the LOG-PROB of token at position t, which is computed
+        # from logits[t-1]; the cross-entropy below handles that shift.
+        positions = torch.arange(max_len, device=device).unsqueeze(0)  # [1, T]
+        q_lens = torch.tensor(
+            [len(q) for q in question_ids_per], dtype=torch.long, device=device,
+        ).unsqueeze(1)  # [B, 1]
+        full_lens = torch.tensor(
+            [len(f) for f in full_ids_per], dtype=torch.long, device=device,
+        ).unsqueeze(1)  # [B, 1]
+        completion_mask = ((positions >= q_lens) & (positions < full_lens)).float()
+
+        # Use cross_entropy(reduction='none') for fused log_softmax + gather.
+        # Predict token at position t from logits[t-1]; ignore the very first
+        # token (position 0) which has no predictor.
+        target = padded[:, 1:].contiguous()                    # [B, T-1]
+        pred_logits = logits[:, :-1, :].contiguous()           # [B, T-1, V]
+        token_lp = -torch.nn.functional.cross_entropy(
+            pred_logits.view(-1, pred_logits.size(-1)),
+            target.view(-1),
+            reduction="none",
+        ).view(B, max_len - 1)                                  # [B, T-1]
+
+        # Align mask with the [T-1] predicted-token axis: a token at
+        # position t (1-indexed in padded) is predicted by logits[t-1].
+        comp_mask_shifted = completion_mask[:, 1:]              # [B, T-1]
+        masked_lp = token_lp * comp_mask_shifted
+        denom = comp_mask_shifted.sum(dim=1).clamp(min=1.0)     # [B]
+        mean_lp = masked_lp.sum(dim=1) / denom                  # [B]
+
+        if self.normalize:
+            # Sigmoid normalization: shift so typical log-probs (-3..-1)
+            # land in 0.05-0.73 — same scaling as `score()`.
+            scores = torch.sigmoid(mean_lp + 2.0)
+        else:
+            scores = mean_lp
+
+        return scores.detach().cpu().tolist()
 
 
 class _RewardFnWrapper:

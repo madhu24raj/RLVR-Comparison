@@ -755,11 +755,16 @@ class PPOTrainer:
         # ── Policy forward pass: per-token NEW log probs (with grad) ─────────
         # The response mask is purely a function of token positions, not policy
         # params, so we discard the mask from this call and reuse `mask`.
-        # P12: On epoch 0, new_per_token is bitwise-identical to old_per_token
-        # (no optimizer step has occurred yet). Skip the redundant forward pass.
-        # Ratio is identically 1.0, so policy_loss = -mean(advantages) which has
-        # zero gradient through the policy; the critic still updates normally.
-        if is_first_epoch:
+        # P12: On epoch 0 with NO reference anchor, new_per_token is bitwise-
+        # identical to old_per_token (no optimizer step has occurred yet) and
+        # we can skip the redundant forward pass — the PPO surrogate ratio is
+        # 1.0, kl(old||new)=0, and the critic still updates normally.
+        # B1 fix: when reference_kl_coeff > 0, we MUST run a real forward on
+        # epoch 0 too. Otherwise kl_ref = (clone(old) - ref) is constant w.r.t.
+        # policy params, contributing zero gradient on epoch 0 and silently
+        # losing 1/K of the reference-anchor signal (25% at K=4).
+        skip_forward = is_first_epoch and self.config.reference_kl_coeff == 0
+        if skip_forward:
             new_per_token = old_per_token.detach().clone()
         else:
             new_per_token, _ = self._batched_per_token_log_probs(
@@ -1166,6 +1171,14 @@ def load_ppo_trainer(
         device = device_or_accelerator
         is_ddp = False
 
+    # Rank-0 print helper. Under DDP every rank runs `load_ppo_trainer`;
+    # without gating, every "[PPO] Loading model: ..." line fires N times.
+    # The `accelerator.main_process_first` block below serialises the
+    # actual HF load, so the prints aren't garbled — but they duplicate.
+    def _print0(*args, **kwargs):
+        if accelerator is None or accelerator.is_main_process:
+            print(*args, **kwargs)
+
     # Determine dtype
     if config.torch_dtype == "auto":
         torch_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
@@ -1174,7 +1187,7 @@ def load_ppo_trainer(
     else:
         torch_dtype = torch.float32
 
-    print(f"[PPO] Loading model: {config.model_name} (device={device}, dtype={torch_dtype})")
+    _print0(f"[PPO] Loading model: {config.model_name} (device={device}, dtype={torch_dtype})")
 
     # Under DDP, every rank would otherwise hit HuggingFace concurrently on
     # cold cache: rate-limit hits, redundant downloads, on-disk cache thrash.
@@ -1209,11 +1222,11 @@ def load_ppo_trainer(
         model.gradient_checkpointing_enable(
             gradient_checkpointing_kwargs={"use_reentrant": False}
         )
-        print("[PPO] Gradient checkpointing enabled")
+        _print0("[PPO] Gradient checkpointing enabled")
 
     hidden_size = model.config.hidden_size
-    print(f"[PPO] Model hidden size: {hidden_size} | "
-          f"Critic capacity: {config.critic_capacity}")
+    _print0(f"[PPO] Model hidden size: {hidden_size} | "
+            f"Critic capacity: {config.critic_capacity}")
 
     # Keep critic in float32 even when model is bf16
     critic = build_critic(config.critic_capacity, hidden_size)
@@ -1227,8 +1240,8 @@ def load_ppo_trainer(
     # reference model because it never sees gradients.
     reference_model = None
     if config.reference_kl_coeff > 0:
-        print(f"[PPO] reference_kl_coeff={config.reference_kl_coeff} > 0; "
-              f"loading frozen reference model (doubles weight memory)")
+        _print0(f"[PPO] reference_kl_coeff={config.reference_kl_coeff} > 0; "
+                f"loading frozen reference model (doubles weight memory)")
 
         # Optional bnb quantization (memory_optimization §11.2). Reference
         # model is never trained, so quantization is safe.
@@ -1245,7 +1258,7 @@ def load_ppo_trainer(
                         bnb_4bit_quant_type="nf4",
                     )
             except ImportError:
-                print(
+                _print0(
                     f"[PPO] WARNING: reference_quant='{config.reference_quant}' "
                     "but bitsandbytes not installed; loading reference at full "
                     "precision. Install with: pip install bitsandbytes"
