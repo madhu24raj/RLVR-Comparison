@@ -140,6 +140,29 @@ def run_one_capacity(
 
         metrics = trainer.train_step(batch_p, batch_gt)
 
+        # Per-step training-metrics row. Same pattern as run_e2_7: log the
+        # cheap training metrics every log_every steps; the richer eval row
+        # (test_accuracy + critic_error_ev + advantage_bias) is added below
+        # on the eval_every cadence and overwrites this row when both fire
+        # on the same step.
+        if step % cfg.log_every == 0 and _is_main():
+            logger.log_step(
+                step,
+                train_accuracy=metrics["accuracy"],
+                mean_reward=metrics["mean_reward"],
+                reward_variance=metrics["reward_variance"],
+                policy_loss=metrics["policy_loss"],
+                critic_loss=metrics["critic_loss"],
+                clip_fraction=metrics["clip_fraction"],
+                kl_divergence=metrics["kl_divergence"],
+                kl_ref_divergence=metrics["kl_ref_divergence"],
+                parse_success_rate=metrics["parse_success_rate"],
+                format_match_rate=metrics["format_match_rate"],
+                reward_nonzero_rate=metrics["reward_nonzero_rate"],
+                total_rollouts=metrics["total_rollouts"],
+            )
+            logger.save()  # flush incrementally — cheap JSON write
+
         if step % cfg.eval_every == 0:
             test_acc = trainer.evaluate(test_prompts, test_gts, n_eval=cfg.eval_size)
             accuracy_curve.append((metrics["total_rollouts"], test_acc))

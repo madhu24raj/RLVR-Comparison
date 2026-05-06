@@ -252,6 +252,33 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
                 f"| critic_loss={metrics['critic_loss']:.4f} "
                 f"| kl={metrics['kl_divergence']:.4f}"
             )
+            # Per-step training-metrics row in the JSON log. The richer eval
+            # row (with test_accuracy / advantage_error / stability) is added
+            # below on the eval_every cadence and OVERWRITES this row's step
+            # number when both fire on the same step (logger.log_step keys
+            # by step). Non-eval steps get this lightweight row, which is
+            # what the user actually wants for "save more steps to JSON".
+            # Gated on rank 0 because logger.log_step mutates rank-local
+            # state that's only flushed by rank 0.
+            if _is_main():
+                logger.log_step(
+                    step,
+                    train_accuracy=metrics["accuracy"],
+                    mean_reward=metrics["mean_reward"],
+                    reward_variance=metrics["reward_variance"],
+                    policy_loss=metrics["policy_loss"],
+                    critic_loss=metrics["critic_loss"],
+                    clip_fraction=metrics["clip_fraction"],
+                    kl_divergence=metrics["kl_divergence"],
+                    kl_ref_divergence=metrics["kl_ref_divergence"],
+                    parse_success_rate=metrics["parse_success_rate"],
+                    format_match_rate=metrics["format_match_rate"],
+                    reward_nonzero_rate=metrics["reward_nonzero_rate"],
+                    total_rollouts=metrics["total_rollouts"],
+                )
+                # Flush incrementally so a crash mid-run still leaves a
+                # readable JSON. Cheap — JSON write of ~40 entries is < 1 ms.
+                logger.save()
 
         # ── Periodic evaluation ───────────────────────────────────────────────
         if step % config.eval_every == 0:
