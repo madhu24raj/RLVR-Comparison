@@ -478,6 +478,10 @@ if __name__ == "__main__":
              "compatibility but resumption will be skipped with a warning.",
     )
     parser.add_argument(
+        "--log-every", type=int, default=None,
+        help="Override config.log_every (per-step JSON metrics cadence)",
+    )
+    parser.add_argument(
         "--reward-model-capacity", type=str, default=None,
         choices=["none", "small", "large"],
         help="Learned reward model tier (none = use deterministic gsm8k_reward only)",
@@ -518,6 +522,8 @@ if __name__ == "__main__":
         cfg.length_bucketed_generation = True
     if args.checkpoint_every is not None:
         cfg.checkpoint_every = args.checkpoint_every
+    if args.log_every is not None:
+        cfg.log_every = args.log_every
     if args.resume_from:
         cfg.resume_from = args.resume_from
         print(

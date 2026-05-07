@@ -452,6 +452,10 @@ if __name__ == "__main__":
         help="Path to checkpoint dir, or 'auto' for latest",
     )
     parser.add_argument(
+        "--log-every", type=int, default=None,
+        help="Override config.log_every (per-step JSON metrics cadence)",
+    )
+    parser.add_argument(
         "--reward-mode", type=str, default=None,
         choices=["deterministic", "self_judge", "combined"],
         help="Reward mode: deterministic (binary), self_judge (log-likelihood), combined",
@@ -508,6 +512,8 @@ if __name__ == "__main__":
     cfg.seed = args.seed
     if args.checkpoint_every is not None:
         cfg.checkpoint_every = args.checkpoint_every
+    if args.log_every is not None:
+        cfg.log_every = args.log_every
     if args.resume_from:
         cfg.resume_from = args.resume_from
     if args.reward_mode:
