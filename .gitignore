@@ -35,4 +35,7 @@ checkpoints/
 CLAUDE.md
 
 # Git worktrees
-.worktrees/
+.worktrees/*.pt
+*.safetensors
+*.pt
+*.safetensors
