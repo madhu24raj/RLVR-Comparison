@@ -65,7 +65,15 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
         # a parameter from the gradient pass, AND saves ~5-10 ms/step (DDP's
         # auto-detection is otherwise on by default).
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-        accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+        # Force CPU-distributed mode when CUDA is not available. Some accelerate
+        # versions do not auto-enable distributed-CPU on torchrun env vars
+        # alone — they assume distributed = GPU, fall back to single-process,
+        # and silently let every rank act as is_main_process=True. The
+        # `cpu=True` kwarg makes Accelerate honor LOCAL_RANK / WORLD_SIZE for
+        # gloo CPU mode regardless of version.
+        import torch as _torch
+        force_cpu = not _torch.cuda.is_available()
+        accelerator = Accelerator(cpu=force_cpu, kwargs_handlers=[ddp_kwargs])
         device = accelerator.device
         # One Accelerate seed call covers python/numpy/torch/torch.cuda streams.
         accelerate_set_seed(config.seed)
@@ -75,16 +83,20 @@ def run_e2_7(config: PPOConfig, compute_mc: bool = True) -> None:
             f"accelerator.num_processes={accelerator.num_processes}; "
             f"adjust config."
         )
-        # Multi-node guard (§7.6 W4): if the user bumped num_machines but
-        # didn't set up rendezvous env vars, fail loudly instead of hanging
-        # in NCCL connect. Multi-node is out-of-scope for Phase 2 — see
-        # ddp_cpu_gpu_migration.md §10.
-        if accelerator.num_machines > 1 and not os.environ.get("MASTER_ADDR"):
+        # Multi-node guard (§7.6 W4): if running across more than one node
+        # without rendezvous env vars set, fail loudly instead of hanging in
+        # NCCL/gloo connect. Use env vars instead of accelerator.num_machines
+        # because the latter only exists in newer accelerate releases.
+        # WORLD_SIZE > LOCAL_WORLD_SIZE means the global process pool spans
+        # more than just this host (set by both torchrun and accelerate launch).
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
+        if world_size > local_world_size and not os.environ.get("MASTER_ADDR"):
             raise RuntimeError(
-                f"Accelerator num_machines={accelerator.num_machines} but "
-                f"MASTER_ADDR is unset. Multi-node training requires "
-                f"MASTER_ADDR/MASTER_PORT in the environment (set them in "
-                f"the SLURM script from $SLURM_NODELIST). Multi-node is "
+                f"Multi-node run detected (WORLD_SIZE={world_size} > "
+                f"LOCAL_WORLD_SIZE={local_world_size}) but MASTER_ADDR is "
+                f"unset. Set MASTER_ADDR/MASTER_PORT in the launch script "
+                f"(typically derived from $SLURM_NODELIST). Multi-node is "
                 f"out-of-scope for Phase 2; see ddp_cpu_gpu_migration.md §10."
             )
     else:

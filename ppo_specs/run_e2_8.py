@@ -270,19 +270,28 @@ def run_e2_8(config: PPOConfig, capacities: list[str]) -> None:
         # find_unused_parameters=False: fail-fast if any param is dropped
         # from the grad pass (and ~5-10 ms/step faster than the default).
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-        accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
+        # See run_e2_7.py for rationale: cpu=True is required to make older
+        # accelerate versions honor torchrun's distributed env vars when no
+        # GPU is visible. Without it, every rank thinks it's main_process
+        # and the rank-0 gates leak.
+        force_cpu = not torch.cuda.is_available()
+        accelerator = Accelerator(cpu=force_cpu, kwargs_handlers=[ddp_kwargs])
         device = accelerator.device
         accelerate_set_seed(config.seed)
         assert config.batch_size % accelerator.num_processes == 0, (
             f"config.batch_size={config.batch_size} not divisible by "
             f"accelerator.num_processes={accelerator.num_processes}"
         )
-        # Multi-node guard: see run_e2_7.py for rationale.
-        if accelerator.num_machines > 1 and not os.environ.get("MASTER_ADDR"):
+        # Multi-node guard: see run_e2_7.py for rationale. Use env vars
+        # instead of accelerator.num_machines (the latter only exists in
+        # newer accelerate versions).
+        world_size = int(os.environ.get("WORLD_SIZE", "1"))
+        local_world_size = int(os.environ.get("LOCAL_WORLD_SIZE", str(world_size)))
+        if world_size > local_world_size and not os.environ.get("MASTER_ADDR"):
             raise RuntimeError(
-                f"Accelerator num_machines={accelerator.num_machines} but "
-                f"MASTER_ADDR is unset. Multi-node training requires "
-                f"MASTER_ADDR/MASTER_PORT (out-of-scope for Phase 2)."
+                f"Multi-node run detected (WORLD_SIZE={world_size} > "
+                f"LOCAL_WORLD_SIZE={local_world_size}) but MASTER_ADDR is "
+                f"unset. Multi-node is out-of-scope for Phase 2."
             )
     else:
         accelerator = None
