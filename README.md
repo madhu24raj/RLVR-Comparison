@@ -1,9 +1,8 @@
 # RLVR-Comparison: GRPO vs. PPO vs. DPO on Verifiable Rewards
 
-**Course:** Foundations of RL with Verifiable Rewards (JHU, Spring 2026)  
+**Course:** Machine Learning: Learning Theory (JHU, Spring 2026)  
 **Instructor:** Raman Arora  
 **Authors:** Tomoya Furutani, Madhumitha Rajaprakash, Kiran Shay, Andrew Gilbert  
-**Contact:** `mrajapr2@jhu.edu` · `tfuruta1@jhu.edu`
 
 ---
 
