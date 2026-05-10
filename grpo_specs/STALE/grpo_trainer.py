@@ -37,7 +37,7 @@ from src.rewards import gsm8k_reward
 from eval.metrics import ExperimentLogger
 from eval.metrics import accuracy as compute_accuracy
 
-from grpo_specs.config import GRPOConfig
+from grpo_specs.STALE.config import GRPOConfig
 from shared.per_token_loss import (
     batched_per_token_log_probs,
     clipped_surrogate_loss,
