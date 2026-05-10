@@ -513,15 +513,7 @@ def run_single_seed(args, seed: int, budget: ComputeBudget) -> Dict:
 
     logger = ExperimentLogger(
         experiment_name=exp_name,
-        method="grpo",
-        config={
-            "model":             args.model,
-            "G":                 args.G,
-            "label_regime":      args.label_regime,
-            "seed":              seed,
-            "batch_size":        args.batch_size,
-            "completion_budget": args.completion_budget,
-        },
+        output_dir=args.output_dir,
     )
 
     # ── TRL GRPOTrainer ───────────────────────────────────────────────────────
