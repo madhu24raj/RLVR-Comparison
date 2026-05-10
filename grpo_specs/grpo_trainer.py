@@ -88,6 +88,15 @@ NOISY_FLIP_PROB      = 0.10   # E2.9: flip 10% of reward labels
 #     shared infrastructure stays clean.
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _trl_014_reward_fn(prompts: List[str], completions: List[str], ground_truth: List[str], **kwargs) -> List[float]:
+    """Reward function compatible with TRL 0.14's GRPOTrainer.
+
+    TRL 0.14 calls: reward_func(prompts=..., completions=..., **dataset_kwargs)
+    where ground_truth comes from the dataset column.
+    """
+    return batch_reward(completions, ground_truth)
+
+
 def make_sparse_reward_fn(seed: int = 42) -> Callable:
     """
     Sparse regime (E2.9): keep only SPARSE_KEEP_FRACTION of reward labels.
@@ -96,8 +105,8 @@ def make_sparse_reward_fn(seed: int = 42) -> Callable:
     """
     rng = random.Random(seed)
 
-    def sparse_fn(completions: List[str], ground_truth: List[str], **kwargs) -> List[float]:
-        rewards = trl_reward_fn(completions, ground_truth, **kwargs)
+    def sparse_fn(prompts: List[str], completions: List[str], ground_truth: List[str], **kwargs) -> List[float]:
+        rewards = batch_reward(completions, ground_truth)
         return [r if rng.random() < SPARSE_KEEP_FRACTION else 0.0 for r in rewards]
 
     return sparse_fn
@@ -110,8 +119,8 @@ def make_noisy_reward_fn(seed: int = 42) -> Callable:
     """
     rng = random.Random(seed)
 
-    def noisy_fn(completions: List[str], ground_truth: List[str], **kwargs) -> List[float]:
-        rewards = trl_reward_fn(completions, ground_truth, **kwargs)
+    def noisy_fn(prompts: List[str], completions: List[str], ground_truth: List[str], **kwargs) -> List[float]:
+        rewards = batch_reward(completions, ground_truth)
         return [(1.0 - r) if rng.random() < NOISY_FLIP_PROB else r for r in rewards]
 
     return noisy_fn
@@ -124,7 +133,7 @@ def get_reward_fn(label_regime: str, seed: int) -> Callable:
     elif label_regime == "noisy":
         return make_noisy_reward_fn(seed=seed)
     else:
-        return trl_reward_fn   # full regime: use shared fn directly
+        return _trl_014_reward_fn
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -434,17 +443,13 @@ def build_grpo_config(args, seed: int) -> GRPOConfig:
     return GRPOConfig(
         output_dir=os.path.join(args.output_dir, f"seed{seed}"),
 
-        # GRPO group size — sweep {4, 8, 16} for E2.8
+        # GRPO group size
         num_generations=args.G,
 
         # Generation
         max_prompt_length=512,
         max_completion_length=512,
         temperature=0.7,
-        top_p=0.9,
-
-        # PPO-clip
-        epsilon=0.2,
 
         # KL against frozen reference model
         beta=0.04,
@@ -464,6 +469,7 @@ def build_grpo_config(args, seed: int) -> GRPOConfig:
         bf16=torch.cuda.is_available(),
         dataloader_num_workers=0,
         remove_unused_columns=False,   # keep ground_truth column for reward fn
+        gradient_checkpointing=True,   # needed to fit 1.5B on V100
     )
 
 
@@ -519,7 +525,7 @@ def run_single_seed(args, seed: int, budget: ComputeBudget) -> Dict:
     grpo_cfg = build_grpo_config(args, seed)
     trainer  = GRPOTrainer(
         model=args.model,
-        config=grpo_cfg,
+        args=grpo_cfg,
         reward_funcs=reward_fn,
         train_dataset=train_ds,
         eval_dataset=eval_ds,
