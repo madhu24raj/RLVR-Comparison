@@ -432,7 +432,6 @@ class GRPOCallback(TrainerCallback):
 
 def build_grpo_config(args, seed: int) -> GRPOConfig:
     return GRPOConfig(
-        model_name_or_path=args.model,
         output_dir=os.path.join(args.output_dir, f"seed{seed}"),
 
         # GRPO group size — sweep {4, 8, 16} for E2.8
@@ -519,6 +518,7 @@ def run_single_seed(args, seed: int, budget: ComputeBudget) -> Dict:
     # ── TRL GRPOTrainer ───────────────────────────────────────────────────────
     grpo_cfg = build_grpo_config(args, seed)
     trainer  = GRPOTrainer(
+        model=args.model,
         config=grpo_cfg,
         reward_funcs=reward_fn,
         train_dataset=train_ds,
