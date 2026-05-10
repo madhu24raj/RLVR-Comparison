@@ -439,7 +439,7 @@ def load_grpo_trainer(config: GRPOConfig, device: torch.device) -> GRPOTrainer:
               f"loading frozen reference model (doubles weight memory)")
         reference_model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
-            dtype=torch_dtype,
+            torch_dtype=torch_dtype,
         ).to(device)
         reference_model.eval()
         for p in reference_model.parameters():
