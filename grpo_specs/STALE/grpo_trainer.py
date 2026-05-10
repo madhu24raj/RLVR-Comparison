@@ -427,6 +427,12 @@ def load_grpo_trainer(config: GRPOConfig, device: torch.device) -> GRPOTrainer:
         dtype=torch_dtype,
     ).to(device)
 
+    if getattr(config, '_gradient_checkpointing', False):
+        model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        print("[GRPO] Gradient checkpointing enabled")
+
     reference_model = None
     if config.reference_kl_coeff > 0:
         print(f"[GRPO] reference_kl_coeff={config.reference_kl_coeff} > 0; "
