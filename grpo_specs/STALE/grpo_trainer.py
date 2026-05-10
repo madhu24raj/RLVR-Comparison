@@ -424,7 +424,7 @@ def load_grpo_trainer(config: GRPOConfig, device: torch.device) -> GRPOTrainer:
 
     model = AutoModelForCausalLM.from_pretrained(
         config.model_name,
-        dtype=torch_dtype,
+        torch_dtype=torch_dtype,
     ).to(device)
 
     if getattr(config, '_gradient_checkpointing', False):
