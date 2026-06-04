@@ -54,8 +54,11 @@ def save_grpo_checkpoint(
     trainer.model.save_pretrained(str(model_dir))
     trainer.tokenizer.save_pretrained(str(model_dir))
 
-    # Optimizer.
-    torch.save(trainer.optimizer.state_dict(), str(tmp_path / "optimizer.pt"))
+    # Optimizer (if the trainer keeps a persistent one — DPO does not, since it
+    # spins up a fresh TRL trainer per step, so there's nothing to persist).
+    optimizer = getattr(trainer, "optimizer", None)
+    if optimizer is not None:
+        torch.save(optimizer.state_dict(), str(tmp_path / "optimizer.pt"))
 
     # Training counters (task/model recorded for a resume sanity check).
     training_state = {
@@ -110,8 +113,10 @@ def load_grpo_checkpoint(ckpt_path: str, device: torch.device) -> Dict[str, Any]
     with open(ckpt / "logger_state.json") as f:
         logger_log = json.load(f)
 
-    optimizer_state = torch.load(
-        str(ckpt / "optimizer.pt"), map_location="cpu", weights_only=True
+    opt_path = ckpt / "optimizer.pt"
+    optimizer_state = (
+        torch.load(str(opt_path), map_location="cpu", weights_only=True)
+        if opt_path.exists() else None
     )
     rng_states = torch.load(
         str(ckpt / "rng_states.pt"), map_location="cpu", weights_only=False
