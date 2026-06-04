@@ -47,6 +47,12 @@ class GRPOConfig:
     output_dir: str = "results"
     torch_dtype: str = "auto"
 
+    # -- Checkpointing (survive disconnects / Slurm time limits) --
+    checkpoint_every: int = 0           # save every N steps (0 = disabled)
+    keep_checkpoints: int = 3           # keep last K periodic checkpoints (0 = keep all)
+    checkpoint_dir: str = "results/checkpoints"
+    resume_from: str = ""               # checkpoint dir path, or "auto" for latest
+
 
 # -- Preset configs --
 

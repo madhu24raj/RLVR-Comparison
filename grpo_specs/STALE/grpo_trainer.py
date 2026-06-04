@@ -407,8 +407,19 @@ class GRPOTrainer:
 
 # -- Factory --
 
-def load_grpo_trainer(config: GRPOConfig, device: torch.device) -> GRPOTrainer:
-    """Load model, tokenizer, and optionally reference model."""
+def load_grpo_trainer(
+    config: GRPOConfig,
+    device: torch.device,
+    model_path_override: Optional[str] = None,
+) -> GRPOTrainer:
+    """Load model, tokenizer, and optionally reference model.
+
+    Args:
+        model_path_override: If set (resume), load the POLICY model + tokenizer
+            from this path (a saved checkpoint dir) instead of config.model_name.
+            The frozen reference model always loads from config.model_name — it
+            must stay the INITIAL policy for the KL anchor, not the resumed one.
+    """
     if config.torch_dtype == "auto":
         torch_dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     elif config.torch_dtype == "bfloat16":
@@ -416,15 +427,16 @@ def load_grpo_trainer(config: GRPOConfig, device: torch.device) -> GRPOTrainer:
     else:
         torch_dtype = torch.float32
 
-    print(f"[GRPO] Loading model: {config.model_name} (device={device}, dtype={torch_dtype})")
+    policy_src = model_path_override or config.model_name
+    print(f"[GRPO] Loading model: {policy_src} (device={device}, dtype={torch_dtype})")
 
-    tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+    tokenizer = AutoTokenizer.from_pretrained(policy_src)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
     model = AutoModelForCausalLM.from_pretrained(
-        config.model_name,
+        policy_src,
         torch_dtype=torch_dtype,
     ).to(device)
 

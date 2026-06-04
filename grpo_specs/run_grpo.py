@@ -33,6 +33,10 @@ from src.tasks import get_task
 from eval.metrics import ExperimentLogger
 from grpo_specs.STALE.config import GRPOConfig, local_test_config, e2_7_config
 from grpo_specs.STALE.grpo_trainer import load_grpo_trainer
+from grpo_specs.checkpoint import (
+    save_grpo_checkpoint, load_grpo_checkpoint,
+    find_latest_checkpoint, restore_rng_states, GracefulExitHandler,
+)
 
 
 def cycle_batch(items, step, batch_size):
@@ -67,8 +71,27 @@ def run_grpo(config: GRPOConfig) -> None:
     train_gts = [ex["ground_truth"] for ex in train_ds]
     test_gts  = [ex["ground_truth"] for ex in test_ds]
 
+    # -- Resume? (resolve before building the trainer so we can load policy
+    #    weights straight from the checkpoint dir) --
+    ckpt_dir = f"{config.checkpoint_dir}/{config.experiment_name}"
+    resume_state = None
+    model_path_override = None
+    resume_path = config.resume_from
+    if resume_path:
+        if resume_path == "auto":
+            resume_path = find_latest_checkpoint(ckpt_dir)
+        if resume_path:
+            print(f"[GRPO] Resuming from {resume_path}")
+            resume_state = load_grpo_checkpoint(resume_path, device)
+            if resume_state.get("task") and resume_state["task"] != config.task:
+                print(f"[GRPO] WARNING: checkpoint task={resume_state['task']!r} "
+                      f"!= config task={config.task!r}")
+            model_path_override = resume_state["model_path"]
+        else:
+            print(f"[GRPO] No checkpoint found in {ckpt_dir}; starting fresh.")
+
     # -- Trainer --
-    trainer = load_grpo_trainer(config, device)
+    trainer = load_grpo_trainer(config, device, model_path_override=model_path_override)
 
     train_prompts = [task.format_prompt(ex, trainer.tokenizer) for ex in train_ds]
     test_prompts  = [task.format_prompt(ex, trainer.tokenizer) for ex in test_ds]
@@ -76,8 +99,29 @@ def run_grpo(config: GRPOConfig) -> None:
     # -- Training loop --
     logger = ExperimentLogger(config.experiment_name, config.output_dir)
     reward_window: list[float] = []
+    start_step = 0
 
-    for step in range(config.n_steps):
+    if resume_state is not None:
+        trainer.optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+        trainer.total_rollouts = resume_state["total_rollouts"]
+        logger.log = resume_state["logger_log"]
+        restore_rng_states(resume_state["rng_states"])
+        start_step = resume_state["step"] + 1
+        print(f"[GRPO] Resumed at step {start_step} "
+              f"(total_rollouts={trainer.total_rollouts})")
+
+    # Catches SIGTERM/SIGINT and Slurm's pre-preemption SIGUSR1 so we can save
+    # before the runtime goes away.
+    exit_handler = GracefulExitHandler()
+
+    def _checkpoint(step, keep):
+        # Checkpointing is opt-in: with --checkpoint-every 0 (default), runs
+        # write no model (preserves the original from-scratch behavior).
+        if config.checkpoint_every <= 0:
+            return
+        save_grpo_checkpoint(trainer, step, config, logger, ckpt_dir, keep)
+
+    for step in range(start_step, config.n_steps):
         batch_p  = cycle_batch(train_prompts, step, config.batch_size)
         batch_gt = cycle_batch(train_gts,     step, config.batch_size)
 
@@ -115,12 +159,27 @@ def run_grpo(config: GRPOConfig) -> None:
                 f"| stability(var)={stability:.4f}"
             )
 
+        # -- Periodic checkpoint --
+        if config.checkpoint_every > 0 and (step + 1) % config.checkpoint_every == 0:
+            _checkpoint(step, keep=config.keep_checkpoints)
+
+        # -- Graceful exit (disconnect / preemption) --
+        if exit_handler.should_exit:
+            print(f"[GRPO] Graceful exit requested at step {step}; saving checkpoint.")
+            _checkpoint(step, keep=0)  # keep=0 -> don't rotate this emergency save
+            logger.save()
+            return
+
     logger.save()
+
+    # -- Final checkpoint (so a completed run always leaves usable weights) --
+    _checkpoint(config.n_steps - 1, keep=0)
 
     # -- Final evaluation --
     final_acc = trainer.evaluate(test_prompts, test_gts, n_eval=config.final_eval_size)
     print(f"\n[GRPO] Final test accuracy (GRPO, G={config.n_rollouts_per_prompt}): {final_acc:.3f}")
     print(f"[GRPO] Log saved to {config.output_dir}/{config.experiment_name}.json")
+    print(f"[GRPO] Checkpoints in {ckpt_dir}")
 
 
 if __name__ == "__main__":
@@ -142,6 +201,18 @@ if __name__ == "__main__":
                         help="Override number of training steps (handy for smoke tests)")
     parser.add_argument("--max-new-tokens", type=int, default=None,
                         help="Override generation length (lower = faster smoke test)")
+    parser.add_argument("--checkpoint-every", type=int, default=None,
+                        help="Save a checkpoint every N steps (0 = disabled). "
+                             "Enables resume across disconnects / Slurm limits.")
+    parser.add_argument("--keep-checkpoints", type=int, default=None,
+                        help="Keep last K periodic checkpoints (0 = keep all)")
+    parser.add_argument("--resume-from", type=str, default=None,
+                        help="Checkpoint dir to resume from, or 'auto' for the latest")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="Where to write the metrics JSON (point at Drive on Colab). "
+                             "Also sets checkpoint dir under it unless --checkpoint-dir is given.")
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                        help="Where to write checkpoints (defaults to <output-dir>/checkpoints)")
     args = parser.parse_args()
 
     cfg = local_test_config() if args.local_test else e2_7_config(seed=args.seed)
@@ -159,6 +230,19 @@ if __name__ == "__main__":
         cfg.n_steps = args.n_steps
     if args.max_new_tokens is not None:
         cfg.max_new_tokens = args.max_new_tokens
+
+    # Output + checkpoint locations (point at a mounted Drive on Colab).
+    if args.output_dir is not None:
+        cfg.output_dir = args.output_dir
+        cfg.checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
+    if args.checkpoint_dir is not None:
+        cfg.checkpoint_dir = args.checkpoint_dir
+    if args.checkpoint_every is not None:
+        cfg.checkpoint_every = args.checkpoint_every
+    if args.keep_checkpoints is not None:
+        cfg.keep_checkpoints = args.keep_checkpoints
+    if args.resume_from is not None:
+        cfg.resume_from = args.resume_from
 
     # Store gradient_checkpointing on config for load_grpo_trainer
     cfg._gradient_checkpointing = args.gradient_checkpointing
