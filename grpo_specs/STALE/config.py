@@ -39,6 +39,9 @@ class GRPOConfig:
     n_test_samples: int = 500
     seed: int = 42
 
+    # -- Task --
+    task: str = "gsm8k"             # "gsm8k" | "humaneval" (see src/tasks/)
+
     # -- Bookkeeping --
     experiment_name: str = "grpo"
     output_dir: str = "results"

@@ -105,6 +105,9 @@ class PPOConfig:
     # gets reported.
     final_eval_size: int = 200
 
+    # ── Task ─────────────────────────────────────────────────────────────────
+    task: str = "gsm8k"             # "gsm8k" | "humaneval" (see src/tasks/)
+
     # ── Data ─────────────────────────────────────────────────────────────────
     n_train_samples: int = 200
     # Number of test prompts to load. Must be >= max(eval_size, final_eval_size).

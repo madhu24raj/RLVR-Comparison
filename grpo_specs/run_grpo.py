@@ -29,7 +29,7 @@ import torch
 import numpy as np
 from transformers import set_seed as transformers_set_seed
 
-from src.data import load_gsm8k, format_prompt_with_template
+from src.tasks import get_task
 from eval.metrics import ExperimentLogger
 from grpo_specs.STALE.config import GRPOConfig, local_test_config, e2_7_config
 from grpo_specs.STALE.grpo_trainer import load_grpo_trainer
@@ -56,9 +56,13 @@ def run_grpo(config: GRPOConfig) -> None:
     print(f"[GRPO] Device: {device}")
 
     # -- Data --
-    print("[GRPO] Loading GSM8K ...")
-    train_ds = load_gsm8k("train", n_samples=config.n_train_samples, seed=config.seed)
-    test_ds  = load_gsm8k("test",  n_samples=config.n_test_samples)
+    # The task abstraction selects the dataset(s): "gsm8k" loads GSM8K for both
+    # splits; "humaneval" trains on MBPP and evaluates on HumanEval. Both emit
+    # the same (question, ground_truth) schema, so the access below is uniform.
+    task = get_task(config.task)
+    print(f"[GRPO] Task: {task.name} | Loading data ...")
+    train_ds = task.load("train", n_samples=config.n_train_samples, seed=config.seed)
+    test_ds  = task.load(task.eval_split, n_samples=config.n_test_samples, seed=config.seed)
 
     train_gts = [ex["ground_truth"] for ex in train_ds]
     test_gts  = [ex["ground_truth"] for ex in test_ds]
@@ -66,12 +70,8 @@ def run_grpo(config: GRPOConfig) -> None:
     # -- Trainer --
     trainer = load_grpo_trainer(config, device)
 
-    train_prompts = [
-        format_prompt_with_template(ex["question"], trainer.tokenizer) for ex in train_ds
-    ]
-    test_prompts = [
-        format_prompt_with_template(ex["question"], trainer.tokenizer) for ex in test_ds
-    ]
+    train_prompts = [task.format_prompt(ex, trainer.tokenizer) for ex in train_ds]
+    test_prompts  = [task.format_prompt(ex, trainer.tokenizer) for ex in test_ds]
 
     # -- Training loop --
     logger = ExperimentLogger(config.experiment_name, config.output_dir)
@@ -135,17 +135,30 @@ if __name__ == "__main__":
                         help="Override group size (completions per prompt)")
     parser.add_argument("--batch-size", type=int, default=None,
                         help="Override batch size (prompts per step)")
+    parser.add_argument("--task", type=str, default=None,
+                        choices=["gsm8k", "humaneval"],
+                        help="Task: gsm8k (default) or humaneval (MBPP train -> HumanEval eval)")
+    parser.add_argument("--n-steps", type=int, default=None,
+                        help="Override number of training steps (handy for smoke tests)")
+    parser.add_argument("--max-new-tokens", type=int, default=None,
+                        help="Override generation length (lower = faster smoke test)")
     args = parser.parse_args()
 
     cfg = local_test_config() if args.local_test else e2_7_config(seed=args.seed)
     cfg.seed = args.seed
 
+    if args.task is not None:
+        cfg.task = args.task
     if args.model_name:
         cfg.model_name = args.model_name
     if args.G is not None:
         cfg.n_rollouts_per_prompt = args.G
     if args.batch_size is not None:
         cfg.batch_size = args.batch_size
+    if args.n_steps is not None:
+        cfg.n_steps = args.n_steps
+    if args.max_new_tokens is not None:
+        cfg.max_new_tokens = args.max_new_tokens
 
     # Store gradient_checkpointing on config for load_grpo_trainer
     cfg._gradient_checkpointing = args.gradient_checkpointing

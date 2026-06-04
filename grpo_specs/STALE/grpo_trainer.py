@@ -34,6 +34,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from src.data import load_gsm8k, format_prompt_with_template
 from src.rewards import gsm8k_reward
+from src.tasks import get_task
 from eval.metrics import ExperimentLogger
 from eval.metrics import accuracy as compute_accuracy
 
@@ -445,11 +446,16 @@ def load_grpo_trainer(config: GRPOConfig, device: torch.device) -> GRPOTrainer:
         for p in reference_model.parameters():
             p.requires_grad_(False)
 
+    # Task-specific verifier. Defaults to "gsm8k", whose reward IS gsm8k_reward,
+    # so the default path is unchanged.
+    task = get_task(config.task)
+    print(f"[GRPO] Task: {task.name}")
+
     return GRPOTrainer(
         config=config,
         model=model,
         tokenizer=tokenizer,
-        reward_fn=gsm8k_reward,
+        reward_fn=task.reward,
         device=device,
         reference_model=reference_model,
     )
