@@ -66,7 +66,9 @@ def load_mbpp(split: str = "train", n_samples: Optional[int] = None, seed: int =
     """Load MBPP (full config) into the unified schema."""
     from datasets import load_dataset  # lazy: only .load() needs `datasets`
 
-    ds = load_dataset("mbpp", "full", split=split)
+    # Canonical namespaced repo id (bare "mbpp" is a legacy script name that
+    # newer datasets/huggingface_hub reject). "full" config = ~974 problems.
+    ds = load_dataset("google-research-datasets/mbpp", "full", split=split)
 
     def _to_unified(ex):
         test_list = ex["test_list"]

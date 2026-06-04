@@ -28,8 +28,9 @@ def load_humaneval(split: str = "test", n_samples: Optional[int] = None, seed: i
     """
     from datasets import load_dataset  # lazy: only .load() needs `datasets`
 
-    # HumanEval only ships a "test" split.
-    ds = load_dataset("openai_humaneval", split="test")
+    # Canonical namespaced repo id (bare "openai_humaneval" is a legacy script
+    # name that newer datasets/huggingface_hub reject). 164 problems, test only.
+    ds = load_dataset("openai/openai_humaneval", split="test")
 
     def _to_unified(ex):
         return {
