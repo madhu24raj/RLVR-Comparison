@@ -7,14 +7,23 @@ subprocess, and report pass/fail. Modeled closely on OpenAI human-eval's
 `execution.py:check_correctness` and its `reliability_guard`.
 
 Isolation mechanics:
-  - Fresh `spawn` subprocess per call (no inherited imports/state/file handles).
-  - Hard wall-clock timeout: parent joins with a deadline, then terminates/kills.
-  - In-child `reliability_guard()`: disables filesystem-mutating + process + network
-    calls (os.remove/rmdir/rename, shutil.rmtree, subprocess, write-mode helpers,
-    socket), clears the environment, and silences stdio.
-  - resource.setrlimit(RLIMIT_CPU / RLIMIT_AS / RLIMIT_DATA) as a secondary guard,
-    skipped on Darwin where RLIMIT_AS is unreliable (matches human-eval).
-  - signal.SIGALRM as an in-child CPU/time backstop.
+  - Subprocess per call. Start method = `fork` on Linux, `spawn` on macOS
+    (env override `RLVR_SANDBOX_START`). This is the crux: under `spawn` the
+    child RE-IMPORTS the `__main__` module — which in a training run is the
+    trainer script that imports torch/transformers (~10s). That blows the join
+    deadline and every program comes back as a false "timeout (no result)" —
+    i.e. all rewards collapse to 0. `fork` makes the child a memory copy that
+    never re-imports `__main__`, so candidate code runs immediately. This is
+    what OpenAI human-eval does.
+  - Hard wall-clock timeout: parent joins with a deadline, then terminates/kills,
+    plus an in-child `signal.SIGALRM` backstop. This is the primary hang guard.
+  - In-child `reliability_guard()`: disables filesystem-mutating + process calls
+    (os.remove/rmdir/rename, shutil.rmtree, subprocess, write-mode helpers),
+    clears the environment, and silences stdio.
+  - RLIMIT_AS is OFF by default: under `fork` the child inherits the parent's
+    (torch/CUDA) virtual address space, which is tens of GB, so capping AS would
+    break inherited mappings. Memory is bounded by the OS sandbox (Slurm cgroup /
+    Colab) instead. Pass `memory_limit_bytes` explicitly to opt back in.
 
 SECURITY NOTE: this neutralizes accidental and casual-malicious code, but it is
 NOT a true security boundary — a determined adversary can escape an in-process
@@ -22,8 +31,7 @@ guard. For untrusted code at scale use OS-level isolation (containers, gVisor,
 firejail, seccomp). In this project the executor runs inside the Slurm job
 sandbox on the cluster, which provides the real boundary.
 
-Pure stdlib: this module must not import torch / datasets / transformers so it
-stays cheap to re-import under `spawn` and usable in minimal environments.
+Pure stdlib: this module must not import torch / datasets / transformers.
 """
 
 from __future__ import annotations
@@ -40,8 +48,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # Default per-program wall-clock budget (seconds).
 DEFAULT_TIMEOUT = 5.0
-# Default address-space cap for the child (bytes). None = no RLIMIT_AS.
-DEFAULT_MEMORY_LIMIT_BYTES = 4 * 1024 * 1024 * 1024  # 4 GB
+# Address-space cap is OFF by default — see the module docstring (fork inherits
+# torch/CUDA virtual memory). Callers can opt in by passing memory_limit_bytes.
+DEFAULT_MEMORY_LIMIT_BYTES = None
 
 
 class TimeoutException(Exception):
@@ -179,9 +188,27 @@ def _unsafe_execute(
         result.append(f"exec_error: {type(exc).__name__}: {exc}")
 
 
-# `spawn` avoids inheriting the parent's imported modules (notably torch/CUDA
-# state in the RL training process) and gives a clean interpreter per call.
-_MP_CONTEXT = multiprocessing.get_context("spawn")
+def _select_start_method() -> str:
+    """Pick a multiprocessing start method for sandbox children.
+
+    `fork` (Linux default) is required when the executor is called from a
+    torch/transformers training script: it does NOT re-import `__main__`, so the
+    child doesn't reload torch and time out. `spawn` re-imports `__main__` and is
+    only safe when that module is lightweight (e.g. macOS dev / standalone tests).
+    Override with RLVR_SANDBOX_START={fork,spawn,forkserver}.
+    """
+    override = os.environ.get("RLVR_SANDBOX_START")
+    available = multiprocessing.get_all_start_methods()
+    if override and override in available:
+        return override
+    if platform.uname().system == "Darwin":
+        return "spawn"  # fork is unsafe on macOS; __main__ is light in dev/tests
+    if "fork" in available:
+        return "fork"
+    return "spawn"
+
+
+_MP_CONTEXT = multiprocessing.get_context(_select_start_method())
 
 
 def check_correctness(
