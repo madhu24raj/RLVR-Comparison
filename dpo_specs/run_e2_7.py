@@ -6,6 +6,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 import argparse
+import dataclasses
 import random
 
 import torch
@@ -25,6 +26,22 @@ from grpo_specs.checkpoint import (
     save_grpo_checkpoint, load_grpo_checkpoint,
     find_latest_checkpoint, restore_rng_states, GracefulExitHandler,
 )
+
+
+# TRL's DPOConfig field set drifts between versions (e.g. recent releases dropped
+# / renamed `max_prompt_length`, `max_length`). Build the config from a superset
+# of desired kwargs but only pass those the *installed* version actually accepts,
+# so the driver runs unchanged across TRL versions on Colab / the cluster.
+_DPO_CONFIG_FIELDS = {f.name for f in dataclasses.fields(TRLDPOConfig)}
+
+
+def _make_trl_dpo_config(**desired):
+    accepted = {k: v for k, v in desired.items() if k in _DPO_CONFIG_FIELDS}
+    dropped = [k for k in desired if k not in _DPO_CONFIG_FIELDS]
+    if dropped:
+        print(f"[DPO] Installed TRL DPOConfig ignores {dropped} "
+              f"(version drift); proceeding without them.")
+    return TRLDPOConfig(**accepted)
 
 class IterativeDPOTrainer:
     def __init__(self, config, model, ref_model, tokenizer, reward_fn, device):
@@ -104,7 +121,7 @@ class IterativeDPOTrainer:
             pair_dict = pairs_to_dataset(pairs)
             dataset = Dataset.from_dict(pair_dict)
             
-            dpo_config = TRLDPOConfig(
+            dpo_config = _make_trl_dpo_config(
                 learning_rate=self.config.learning_rate,
                 per_device_train_batch_size=max(1, len(pairs) // 2),
                 max_length=1024,
@@ -132,12 +149,13 @@ class IterativeDPOTrainer:
             metrics["dpo_loss"] = train_result.training_loss
             
             # 4. Extract KL Divergence from TRL's internal logs
+            _beta = getattr(self.config, "beta", 0.1)
             if trainer.state.log_history:
                 for log in reversed(trainer.state.log_history):
                     if "rewards/chosen" in log:
                         # TRL logs 'rewards/chosen' which mathematically is: beta * (log_pi - log_ref)
                         # Dividing by beta isolates the pure KL divergence!
-                        kl_ref = float(log["rewards/chosen"] / dpo_config.beta)
+                        kl_ref = float(log["rewards/chosen"] / _beta)
                         metrics["kl_ref_divergence"] = kl_ref
                         metrics["kl_divergence"] = kl_ref
                         break
